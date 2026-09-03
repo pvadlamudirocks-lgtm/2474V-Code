@@ -1,0 +1,33 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Executables
+*.bin
+*.elf
+
+# PROS
+build/
+bin/
+.vscode/
+.cache/
+compile_commands.json
+temp.log
+temp.errors
+*.ini
+.d/
+
+# Editor, OS, and temporary files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.swp
+__pycache__/
+.pytest_cache/
+
+# Local Codex metadata and generated project export
+.agents/
+.codex/
+EZ_Template_2474V_Victory_full_project_*.zip
