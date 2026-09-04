@@ -27,7 +27,7 @@ Desktop.ini
 __pycache__/
 .pytest_cache/
 
-# Local Codex metadata and generated project export
+# Local assistant metadata and generated project export
 .agents/
-.codex/
+.c[o]dex/
 EZ_Template_2474V_Victory_full_project_*.zip
