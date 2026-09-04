@@ -27,7 +27,5 @@ Desktop.ini
 __pycache__/
 .pytest_cache/
 
-# Local assistant metadata and generated project export
-.agents/
-.c[o]dex/
+# Generated project archives
 EZ_Template_2474V_Victory_full_project_*.zip
