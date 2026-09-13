@@ -3,12 +3,16 @@
 // EZ-Template owns all four drivetrain motors through this chassis object.
 // Negative ports reverse the two motors proven backward in physical testing.
 ez::Drive chassis(
-    {1, -4},          // Left drive: L1 port 1, L2 reversed port 4.
-    {3, -2},          // Right drive: R1 port 3, R2 reversed port 2.
-    7,                // Existing IMU port; confirm before autonomous testing.
-    2.75,             // Drive-wheel diameter in inches.
-    600,              // Blue motor cartridge speed in RPM.
-    600.0 / 450.0);   // External ratio for 450 RPM effective wheel speed.
+    {1, -4},         // Left drive: L1 port 1, L2 reversed port 4.
+    {3, -2},         // Right drive: R1 port 3, R2 reversed port 2.
+    7,               // Existing IMU port; confirm before autonomous testing.
+    2.75,            // Drive-wheel diameter in inches.
+    600,             // Blue motor cartridge speed in RPM.
+    600.0 / 450.0);  // External ratio for 450 RPM effective wheel speed.
+
+// Pneumatic Solenoids on ADI Ports A and B
+pros::adi::DigitalOut clawSolenoidA('A');
+pros::adi::DigitalOut rotateSolenoidB('B');
 
 // The robot uses one master controller for all driver input.
 pros::Controller master(pros::E_CONTROLLER_MASTER);
@@ -17,6 +21,12 @@ pros::Controller master(pros::E_CONTROLLER_MASTER);
 constexpr double TURN_MULTIPLIER = 1.30;
 constexpr double DRIVER_ACTIVE_BRAKE_KP = 2.0;
 constexpr int DRIVER_DEADZONE = 5;
+
+// pneumatic Latch States
+bool clawOpen = false;
+bool roated = false;
+bool l1Pressed = false;
+bool r1Pressed = false;
 
 // Optional driver response profiles. Disabled in favor of fixed settings.
 // enum class DriveProfile {
@@ -93,6 +103,32 @@ void driver_arcade_control(int forwardInput, int turnInput) {
   chassis.opcontrol_joystick_threshold_iterate(leftOutput, rightOutput);
 }
 
+void control_pneumatics() {
+  // Claw Open/Close Toggle (Button L1)
+  if (master.get_digital(pros::E_CONTROLLER_DIGITAL_L1)) {
+    if (!l1Pressed) {
+      clawOpen = !clawOpen;
+      clawSolenoidA.set_value(clawOpen);
+      l1Pressed = true;
+    }
+  } else {
+    l1Pressed = false;
+  }
+
+  // Claw Roation Toggle (Button R1)
+  if (master.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {
+    if (!r1Pressed) {
+      roated = !roated;
+      rotateSolenoidB.set_value(roated);
+      r1Pressed = true;
+    }
+  } else {
+    r1Pressed = false;
+  }
+}
+
+//-- PROS LIFECYCLE FUNCTIONS -----------------------------------------------------------//
+
 void initialize() {
   pros::lcd::initialize();
   pros::lcd::set_text(0, "INITIALIZING EZ DRIVE");
@@ -105,6 +141,10 @@ void initialize() {
   // Profile-mode initialization (disabled).
   // chassis.opcontrol_curve_default_set(NORMAL_CURVE, NORMAL_CURVE);
   chassis.initialize();
+
+  // Set Inital pneumatic states to retracted/closed
+  clawSolenoidA.set_value(false);
+  rotateSolenoidB.set_value(false);
 
   pros::lcd::set_text(0, "EZ DRIVE READY");
 }
@@ -143,9 +183,15 @@ void opcontrol() {
     int rightX = master.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
     driver_arcade_control(leftY, rightX);
 
+    // handle pneumatic controls
+    control_pneumatics();
+
+    // Diagnostics
     // Keep raw joystick values visible during physical testing.
     pros::lcd::print(2, "LEFT Y:  %4d", leftY);
     pros::lcd::print(3, "RIGHT X: %4d", rightX);
+    pros::lcd::print(4, "CLAW: %s | ROTATION: %s", clawOpen ? "OPEN" : "CLOSED", roated ? "ROTATED" : "UNROTATED");
+
 
     pros::delay(ez::util::DELAY_TIME);
   }
