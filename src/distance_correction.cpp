@@ -15,6 +15,9 @@ constexpr int DIST_BACK_CORRECTION_SIGN = 1;
 constexpr int DIST_FRONT_SQUARE_TURN_SIGN = 1;
 constexpr int DIST_BACK_SQUARE_TURN_SIGN = 1;
 
+// TODO: Deferred sensor redesign must use NEW FRONT = old back, NEW BACK =
+// old front, NEW LEFT = old right, NEW RIGHT = old left. Fixed field walls
+// remain +X, -X, +Y, -Y. Names/ports below are legacy placeholders, unchanged.
 // TODO: Placeholder ports. Change all distance sensor ports after wiring.
 // Front sensors are useful for intake-side alignment or front-facing references.
 pros::Distance frontLeftDistance(8);

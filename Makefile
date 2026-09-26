@@ -20,7 +20,6 @@ EXTRA_CXXFLAGS=-Wno-deprecated-enum-enum-conversion
 USE_PACKAGE:=1
 
 # Add libraries you do not wish to include in the cold image here
-# EXCLUDE_COLD_LIBRARIES:= $(FWDIR)/your_library.a
 EXCLUDE_COLD_LIBRARIES:= 
 
 # Set this to 1 to add additional rules to compile your project as a PROS library template
@@ -32,9 +31,9 @@ VERSION:=1.0.0
 # this line excludes opcontrol.c and similar files
 EXCLUDE_SRC_FROM_LIB+=$(foreach file, $(SRCDIR)/main,$(foreach cext,$(CEXTS),$(file).$(cext)) $(foreach cxxext,$(CXXEXTS),$(file).$(cxxext)))
 
-# TEMP execution diagnostic: build only main.cpp so no other global hardware
-# objects can affect the startup/run test.
-EXCLUDE_SRCDIRS+=$(SRCDIR)/autons.cpp $(SRCDIR)/navigation.cpp $(SRCDIR)/distance_correction.cpp $(SRCDIR)/subsystems.cpp
+# Mechanisms compile but require explicit initialization and commissioning gates.
+# Keep unfinished distance correction excluded from the odometry test program.
+EXCLUDE_SRCDIRS+=$(SRCDIR)/distance_correction.cpp
 
 # files that get distributed to every user (beyond your source archive) - add
 # whatever files you want here. This line is configured to add all header files
@@ -47,3 +46,13 @@ TEMPLATE_FILES=$(INCDIR)/**/*.h $(INCDIR)/**/*.hpp
 ################################################################################
 ########## Nothing below this line should be edited by typical users ###########
 -include ./common.mk
+
+# Observe native exit results without replacing the PID or wait implementations.
+$(HOT_ELF): private LDFLAGS += -Wl,--wrap=_ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb -Wl,--wrap=_ZN2ez5Drive8pid_waitEv
+
+# Link the original EZ wait machine code into the hot image so its
+# exit-check calls can be observed. The rest of EZ remains in the cold image.
+$(BINDIR)/exit_conditions.cpp.o: $(FWDIR)/EZ-Template.a Makefile
+	$(AR) x --output=$(BINDIR) $< exit_conditions.cpp.o
+	$(OBJCOPY) --redefine-sym _ZN2ez5Drive8pid_waitEv=ez_trace_native_pid_wait $@
+$(HOT_ELF): $(BINDIR)/exit_conditions.cpp.o

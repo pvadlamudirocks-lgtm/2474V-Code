@@ -1,39 +1,67 @@
-#include "main.h"
 #include "autons.hpp"
-#include "distance_correction.hpp"
+
+#include <atomic>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <memory>
+#include <vector>
+
+#include "main.h"
 #include "navigation.hpp"
-#include "subsystems.hpp"
+#include "motion_exit_trace.hpp"
 
-/////
-// For installation, upgrading, documentations, and tutorials, check out our website!
-// https://ez-robotics.github.io/EZ-Template/
-/////
+namespace {
+constexpr int OFFSET_CALIBRATION_ITERATIONS = 10;
+constexpr int OFFSET_CALIBRATION_TURN_SPEED = 63;
+constexpr int OFFSET_SETTLE_TIME_MS = 250;
+constexpr double MIN_VALID_TURN_RADIANS = 0.01;
 
-// These are out of 127
-const int DRIVE_SPEED = 110;
-const int TURN_SPEED = 90;
+std::atomic<bool> diagnostic_screen_active{false};
 
-// Sets all drive and odom PID constants used by test autonomous routines.
+double wrapped_angle_error(double target, double current) {
+  double error = target - current;
+  while (error > 180.0) error -= 360.0;
+  while (error < -180.0) error += 360.0;
+  return error;
+}
+
+void show_turn_drift_on_brain(double target_heading, int speed,
+                              double delta_x, double delta_y,
+                              double drift, double heading_error) {
+  pros::lcd::set_text(0, "OLD-FRAME TURN DRIFT");
+  pros::lcd::print(1, "Target: %7.2f deg", target_heading);
+  pros::lcd::print(2, "Speed:  %3d", speed);
+  pros::lcd::print(3, "dX: %8.2f in", delta_x);
+  pros::lcd::print(4, "dY: %8.2f in", delta_y);
+  pros::lcd::print(5, "Drift: %5.2f in", drift);
+  pros::lcd::print(6, "Head err: %6.2f deg", heading_error);
+  pros::lcd::set_text(7, "Full data in terminal");
+}
+}  // namespace
+
 void default_constants() {
-  // P, I, D, and Start I
-  chassis.pid_drive_constants_set(20.0, 0.0, 100.0);         // Fwd/rev constants, used for odom and non odom motions
-  chassis.pid_heading_constants_set(11.0, 0.0, 20.0);        // Holds the robot straight while going forward without odom
-  chassis.pid_turn_constants_set(3.0, 0.05, 20.0, 15.0);     // Turn in place constants
-  chassis.pid_swing_constants_set(6.0, 0.0, 65.0);           // Swing constants
-  chassis.pid_odom_angular_constants_set(6.5, 0.0, 52.5);    // Angular control for odom motions
-  chassis.pid_odom_boomerang_constants_set(5.8, 0.0, 32.5);  // Angular control for boomerang motions
+  chassis.pid_drive_constants_set(20.0, 0.0, 100.0);
+  chassis.pid_heading_constants_set(11.0, 0.0, 20.0);
+  chassis.pid_turn_constants_set(3.0, 0.05, 20.0, 15.0);
+  chassis.pid_swing_constants_set(6.0, 0.0, 65.0);
+  chassis.pid_odom_angular_constants_set(6.5, 0.0, 52.5);
+  chassis.pid_odom_boomerang_constants_set(5.8, 0.0, 32.5);
 
-  // Exit conditions
-  chassis.pid_turn_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg, 500_ms, 500_ms);
-  chassis.pid_swing_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg, 500_ms, 500_ms);
-  chassis.pid_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in, 500_ms, 500_ms);
-  chassis.pid_odom_turn_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg, 500_ms, 750_ms);
-  chassis.pid_odom_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in, 500_ms, 750_ms);
+  chassis.pid_turn_exit_condition_set(150_ms, 1_deg, 250_ms, 7_deg,
+                                      500_ms, 500_ms);
+  chassis.pid_swing_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg,
+                                       500_ms, 500_ms);
+  chassis.pid_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in,
+                                       500_ms, 500_ms);
+  chassis.pid_odom_turn_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg,
+                                           500_ms, 750_ms);
+  chassis.pid_odom_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in,
+                                            500_ms, 750_ms);
   chassis.pid_turn_chain_constant_set(3_deg);
   chassis.pid_swing_chain_constant_set(5_deg);
   chassis.pid_drive_chain_constant_set(3_in);
 
-  // Slew constants
   chassis.slew_turn_constants_set(3_deg, 70);
   chassis.slew_drive_constants_set(3_in, 70);
   chassis.slew_swing_constants_set(3_in, 80);
@@ -42,219 +70,629 @@ void default_constants() {
   chassis.odom_look_ahead_set(7_in);
   chassis.odom_boomerang_distance_set(16_in);
   chassis.odom_boomerang_dlead_set(0.625);
-
-  chassis.pid_angle_behavior_set(ez::shortest);  // Changes the default behavior for turning, this defaults it to the shortest path there
+  chassis.pid_angle_behavior_set(ez::shortest);
 }
 
-// Runs a simple relative drive test using pid_drive_set().
-void drive_test() {
-  // The first parameter is target inches
-  // The second parameter is max speed the robot will drive at
-  // The third parameter is a boolean (true or false) for enabling/disabling a slew at the start of drive motions
-  // for slew, only enable it when the drive distance is greater than the slew distance + a few inches
-
-  chassis.pid_drive_set(24_in, DRIVE_SPEED, true);
-  chassis.pid_wait();
-
-  chassis.pid_drive_set(-12_in, DRIVE_SPEED);
-  chassis.pid_wait();
-
-  chassis.pid_drive_set(-12_in, DRIVE_SPEED);
-  chassis.pid_wait();
+bool odom_diagnostic_screen_is_active() {
+  return diagnostic_screen_active.load();
 }
 
-// Runs a simple turn test using absolute heading targets.
-void turn_test() {
-  // The first parameter is the target in degrees
-  // The second parameter is max speed the robot will drive at
-
-  chassis.pid_turn_set(90_deg, TURN_SPEED);
-  chassis.pid_wait();
-
-  chassis.pid_turn_set(45_deg, TURN_SPEED);
-  chassis.pid_wait();
-
-  chassis.pid_turn_set(0_deg, TURN_SPEED);
-  chassis.pid_wait();
+void odom_diagnostic_screen_release() {
+  diagnostic_screen_active.store(false);
 }
 
-// Runs intake and outtake briefly to confirm motor directions.
-void intake_test() {
-  intake_on();
+// Based on https://github.com/EZ-Robotics/EZ-Template/blob/v3.2.2/src/autons.cpp
+// Report only. Use actual unwrapped rotation for alternating raw +90/-90 trials.
+void measure_offsets() {
+  auto* front = chassis.odom_tracker_front;
+  auto* right = chassis.odom_tracker_right;
+  if (front == nullptr || right == nullptr ||
+      front->smart_encoder.get_port() != 5 || right->smart_encoder.get_port() != 7 ||
+      !front->smart_encoder.is_installed() || !right->smart_encoder.is_installed()) {
+    std::printf("CALIBRATION ERROR: require installed FRONT P5 and RIGHT P7.\n");
+    std::fflush(stdout);
+    return;
+  }
+  const auto previous_brake = chassis.drive_brake_get();
+  const bool previous_print = chassis.pid_print_toggle_get();
+  chassis.pid_print_toggle(false);
+  std::printf("\n===== TRACKER OFFSET CALIBRATION =====\n"
+              "10 trials: raw EZ +90/-90 degrees, speed 63; heading reset per trial.\n"
+              "Raw deltas: centidegrees. Offsets: magnitudes in inches. NOT APPLIED.\n"
+              "Angle divisor: actual unwrapped IMU rotation.\n\n");
+  std::fflush(stdout);
+  double h_sum = 0, v_sum = 0;
+  double h_min = INFINITY, h_max = -INFINITY;
+  double v_min = INFINITY, v_max = -INFINITY;
+  int valid = 0;
+  double directional_h_sum[2] = {}, directional_v_sum[2] = {};
+  int directional_valid[2] = {};
+  double horizontal_values[OFFSET_CALIBRATION_ITERATIONS];
+  double vertical_values[OFFSET_CALIBRATION_ITERATIONS];
+  for (int i = 0; i < OFFSET_CALIBRATION_ITERATIONS; ++i) {
+    chassis.pid_targets_reset();
+    chassis.drive_imu_reset();
+    chassis.drive_sensor_reset();
+    chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
+    chassis.odom_xyt_set(0_in, 0_in, 0_deg);
+    pros::delay(20);  // Allow reset readings to reach the tracking task.
+    const double heading_before = chassis.drive_imu_get();
+    const double h_before = front->smart_encoder.get_position();
+    const double v_before = right->smart_encoder.get_position();
+    const double target = i % 2 == 0 ? 90.0 : -90.0;
+    turn_velocity_trace_begin();
+    chassis.pid_turn_set(target, OFFSET_CALIBRATION_TURN_SPEED, ez::raw);
+    chassis.pid_wait();
+    pros::delay(OFFSET_SETTLE_TIME_MS);
+    chassis.drive_set(0, 0);
+    const double heading_change = chassis.drive_imu_get() - heading_before;
+    const double h_raw = front->smart_encoder.get_position() - h_before;
+    const double v_raw = right->smart_encoder.get_position() - v_before;
+    const double radians = std::fabs(ez::util::to_rad(heading_change));
+    const double h_inches = h_raw / front->ticks_per_inch();
+    const double v_inches = v_raw / right->ticks_per_inch();
+    const bool usable = std::isfinite(radians) && radians >= MIN_VALID_TURN_RADIANS &&
+                        std::isfinite(h_inches) && std::isfinite(v_inches);
+    const double horizontal = usable ? std::fabs(h_inches) / radians : NAN;
+    const double vertical = usable ? std::fabs(v_inches) / radians : NAN;
+    horizontal_values[i] = horizontal;
+    vertical_values[i] = vertical;
+    std::printf("TRIAL %d\nEZ target = %.0f\nactual unwrapped heading change = %.5f deg\n"
+                "horizontal raw delta = %.0f\nvertical raw delta = %.0f\n"
+                "horizontal travel inches = %.5f\nvertical travel inches = %.5f\n"
+                "calculated horizontal offset magnitude = %.5f in\ncalculated vertical offset magnitude = %.5f in\n"
+                "turn exit reason = %s\n"
+                "measurement valid = %s\n\n", i + 1, target, heading_change, h_raw, v_raw,
+                h_inches, v_inches, horizontal, vertical,
+                ez::exit_to_string(turn_velocity_trace_result()).c_str(),
+                usable ? "true" : "false (excluded)");
+    std::fflush(stdout);
+    if (!usable) continue;
+    h_sum += horizontal; v_sum += vertical; ++valid;
+    directional_h_sum[i % 2] += horizontal;
+    directional_v_sum[i % 2] += vertical;
+    ++directional_valid[i % 2];
+    h_min = std::min(h_min, horizontal); h_max = std::max(h_max, horizontal);
+    v_min = std::min(v_min, vertical); v_max = std::max(v_max, vertical);
+  }
+  chassis.drive_brake_set(previous_brake);
+  chassis.pid_print_toggle(previous_print);
+  std::printf("\n+90 trials horizontal average = %.5f\n+90 trials vertical average = %.5f\n"
+              "-90 trials horizontal average = %.5f\n-90 trials vertical average = %.5f\n"
+              "valid directional trials: +90 = %d/5, -90 = %d/5\n",
+              directional_valid[0] ? directional_h_sum[0] / directional_valid[0] : NAN,
+              directional_valid[0] ? directional_v_sum[0] / directional_valid[0] : NAN,
+              directional_valid[1] ? directional_h_sum[1] / directional_valid[1] : NAN,
+              directional_valid[1] ? directional_v_sum[1] / directional_valid[1] : NAN,
+              directional_valid[0], directional_valid[1]);
+  std::printf("\nHORIZONTAL:\nall 10 values (in):");
+  for (double value : horizontal_values) std::printf(" %.5f", value);
+  std::printf("\nVERTICAL:\nall 10 values (in):");
+  for (double value : vertical_values) std::printf(" %.5f", value);
+  std::printf("\n");
+  std::printf("FINAL:\nvalid trials = %d/%d\n"
+              "horizontal average = %.5f\nhorizontal min = %.5f\nhorizontal max = %.5f\n"
+              "horizontal spread = %.5f\n\n"
+              "vertical average = %.5f\nvertical min = %.5f\nvertical max = %.5f\n"
+              "vertical spread = %.5f\n"
+              "NOT APPLIED: configured offsets remain unchanged.\n================================\n",
+              valid, OFFSET_CALIBRATION_ITERATIONS,
+              valid ? h_sum / valid : NAN, valid ? h_min : NAN, valid ? h_max : NAN,
+              valid ? h_max - h_min : NAN,
+              valid ? v_sum / valid : NAN, valid ? v_min : NAN, valid ? v_max : NAN,
+              valid ? v_max - v_min : NAN);
+  std::fflush(stdout);
+}
+// Preserve the existing diagnostic entry point.
+void measure_tracking_offsets() { measure_offsets(); }
+
+void run_turn_drift_test(double target_heading, int speed) {
+  diagnostic_screen_active.store(true);
+
+  const double start_x = chassis.odom_x_get();
+  const double start_y = chassis.odom_y_get();
+  const double start_theta = chassis.odom_theta_get();
+
+  // Raw absolute behavior is intentional so a target of 360 performs a full
+  // revolution instead of being treated as equivalent to 0 degrees.
+  chassis.pid_turn_set(target_heading, speed, ez::raw);
+  chassis.pid_wait();
+
+  const double end_x = chassis.odom_x_get();
+  const double end_y = chassis.odom_y_get();
+  const double end_theta = chassis.odom_theta_get();
+  const double delta_x = end_x - start_x;
+  const double delta_y = end_y - start_y;
+  const double drift = std::hypot(delta_x, delta_y);
+  const double heading_error = wrapped_angle_error(target_heading, end_theta);
+
+  chassis.drive_set(0, 0);
+
+  std::printf("\nINTERNAL / OLD-FRAME TURN DRIFT TEST\n");
+  std::printf("Target heading: %.2f deg\n", target_heading);
+  std::printf("Speed: %d\n", speed);
+  std::printf("Start: X %.3f in | Y %.3f in | Theta %.3f deg\n",
+              start_x, start_y, start_theta);
+  std::printf("End:   X %.3f in | Y %.3f in | Theta %.3f deg\n",
+              end_x, end_y, end_theta);
+  std::printf("Delta X: %.3f in\n", delta_x);
+  std::printf("Delta Y: %.3f in\n", delta_y);
+  std::printf("Position drift magnitude: %.3f in\n", drift);
+  std::printf("Heading error: %.3f deg\n\n", heading_error);
+
+  show_turn_drift_on_brain(target_heading, speed, delta_x, delta_y, drift,
+                           heading_error);
+}
+
+void odom_turn_90_speed_40_test() { run_turn_drift_test(90.0, 40); }
+void odom_turn_90_speed_60_test() { run_turn_drift_test(90.0, 60); }
+void odom_turn_90_speed_100_test() { run_turn_drift_test(90.0, 100); }
+void odom_turn_180_speed_40_test() { run_turn_drift_test(180.0, 40); }
+void odom_turn_360_speed_40_test() { run_turn_drift_test(360.0, 40); }
+
+void odom_geometry_turn_90_test() {
+  // Static snapshots and an independent touch task survive autonomous ending.
+  // Pages contain captured text only: browsing never rereads or resets sensors.
+  static std::string pages[8][8];
+  static int page = 0;
+  static bool pages_ready = false;  // Protected by page_mutex.
+  static pros::Mutex page_mutex;
+  page_mutex.take();
+  pages_ready = false;
+  page_mutex.give();
+  auto show_page = []() {
+    if (!pages_ready || !odom_diagnostic_screen_is_active()) return;
+    for (int line = 0; line < 8; ++line)
+      pros::lcd::set_text(line, pages[page][line]);
+  };
+  diagnostic_screen_active.store(true);
+  // Let any in-progress normal screen refresh finish before taking the screen.
+  pros::delay(60);
+  for (int line = 0; line < 8; ++line) pros::lcd::set_text(line, "");
+  pros::lcd::set_text(0, "OLD-FRAME 90 DEG TURN");
+  pros::lcd::set_text(6, "RUNNING - SPEED 40");
+
+  chassis.drive_set(0, 0);
+  auto* front = chassis.odom_tracker_front;
+  auto* right = chassis.odom_tracker_right;
+  if (front == nullptr || right == nullptr ||
+      !front->smart_encoder.is_installed() || !right->smart_encoder.is_installed()) {
+    pros::lcd::set_text(6, "STOPPED: tracker missing");
+    std::printf("RAW TURN TEST ABORTED: FRONT/RIGHT rotation sensor missing.\n");
+    return;
+  }
+  chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
+  chassis.pid_targets_reset();
+  chassis.drive_sensor_reset();
+  chassis.odom_xyt_set(0_in, 0_in, 0_deg);
+  pros::delay(50);
+  const auto start = chassis.odom_pose_get();
+  // Direct Rotation sensor accumulated position, in signed centidegrees.
+  // EZ tracking_wheel::get_raw() delegates to this same get_position() API.
+  const double front_raw_start = front->smart_encoder.get_position();
+  const double right_raw_start = right->smart_encoder.get_position();
+  const double front_tpi = front->ticks_per_inch();
+  const double right_tpi = right->ticks_per_inch();
+  const double imu_start = chassis.drive_imu_get();
+  pros::lcd::print(6, "F cd: %.0f -> ...", front_raw_start);
+  pros::lcd::print(7, "R cd: %.0f -> ...", right_raw_start);
+  std::printf("\nINTERNAL / OLD-FRAME: 90 DEG TURN | speed 40\n");
+  std::printf("RAW DIAGNOSTIC: cd = signed sensor centidegrees, 36000/revolution.\n");
+  std::printf("FRONT P%d: diameter %.3f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
+              front->smart_encoder.get_port(), front->wheel_diameter_get(),
+              front->ratio_get(), front_tpi, front->distance_to_center_get(),
+              front->distance_to_center_flip_get(), static_cast<long>(front->smart_encoder.get_reversed()));
+  std::printf("RIGHT P%d: diameter %.3f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
+              right->smart_encoder.get_port(), right->wheel_diameter_get(),
+              right->ratio_get(), right_tpi, right->distance_to_center_get(),
+              right->distance_to_center_flip_get(), static_cast<long>(right->smart_encoder.get_reversed()));
+  std::printf("Start: X %.3f in | Y %.3f in | THETA %.3f deg\n",
+              start.x, start.y, start.theta);
+
+  chassis.pid_turn_set(90_deg, 40, ez::raw);
+  chassis.pid_wait();
+  // drive_set disables the motion PID in EZ 3.2.2. Keep odometry running
+  // through settling, then capture the actual pose without resetting it.
+  chassis.drive_set(0, 0);
+  pros::delay(250);
+  const auto final_pose = chassis.odom_pose_get();
+  const double front_raw_end = front->smart_encoder.get_position();
+  const double right_raw_end = right->smart_encoder.get_position();
+  const double imu_end = chassis.drive_imu_get();
+  const double heading_delta_rad = ez::util::to_rad(imu_end - imu_start);
+  const double front_inches = (front_raw_end - front_raw_start) / front_tpi;
+  const double right_inches = (right_raw_end - right_raw_start) / right_tpi;
+  // EZ uses internal angle = -IMU. A positive-heading pure turn needs
+  // FRONT travel = +front_offset * angle, RIGHT travel = -right_offset * angle.
+  const double front_expected = front->distance_to_center_get() * heading_delta_rad;
+  const double right_expected = -right->distance_to_center_get() * heading_delta_rad;
+  const double x_drift = final_pose.x - start.x;
+  const double y_drift = final_pose.y - start.y;
+
+  pros::lcd::print(1, "X: %.3f in", final_pose.x);
+  pros::lcd::print(2, "Y: %.3f in", final_pose.y);
+  pros::lcd::print(3, "THETA: %.3f deg", final_pose.theta);
+  pros::lcd::print(4, "X DRIFT: %.3f in", x_drift);
+  pros::lcd::print(5, "Y DRIFT: %.3f in", y_drift);
+  pros::lcd::print(6, "F cd: %.0f -> %.0f", front_raw_start, front_raw_end);
+  pros::lcd::print(7, "R cd: %.0f -> %.0f", right_raw_start, right_raw_end);
+  std::printf("FRONT raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
+              front_raw_start, front_raw_end, front_raw_end - front_raw_start, front_inches, front_expected);
+  std::printf("RIGHT raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
+              right_raw_start, right_raw_end, right_raw_end - right_raw_start, right_inches, right_expected);
+  std::printf("IMU: %.5f -> %.5f deg | unwrapped delta %.6f rad\n", imu_start, imu_end, heading_delta_rad);
+  if (std::fabs(heading_delta_rad) > 0.01) {
+    std::printf("Signed pure-turn radii: FRONT %+.5f in | RIGHT %+.5f in (NOT APPLIED)\n",
+                front_inches / heading_delta_rad, -right_inches / heading_delta_rad);
+  }
+  std::printf("Final: X %.3f in | Y %.3f in | THETA %.3f deg\n",
+              final_pose.x, final_pose.y, final_pose.theta);
+  std::printf("X DRIFT: %.3f in | Y DRIFT: %.3f in\n",
+              x_drift, y_drift);
+  std::printf("STOPPED. Final pose retained; no post-turn XY reset.\n");
+  const int terminal_flush_status = std::fflush(stdout);
+  const int terminal_error_flag = std::ferror(stdout);
+  auto text_value = [](const char* format, double value) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), format, value);
+    return std::string(buffer);
+  };
+  page_mutex.take();
+  for (int p = 0; p < 8; ++p) {
+    for (int line = 0; line < 8; ++line) pages[p][line].clear();
+    pages[p][7] = "OLD-FRAME | TAP < / >";
+  }
+  pages[0][0] = "1/8 STOPPED: 90 DEG";
+  pages[0][1] = text_value("X: %+.3f in", final_pose.x);
+  pages[0][2] = text_value("Y: %+.3f in", final_pose.y);
+  pages[0][3] = text_value("THETA: %.3f deg", final_pose.theta);
+  pages[0][4] = text_value("X DRIFT: %+.3f in", x_drift);
+  pages[0][5] = text_value("Y DRIFT: %+.3f in", y_drift);
+  pages[0][6] = "90 deg / speed 40";
+
+  pages[1][0] = "2/8 FRONT RAW";
+  pages[1][1] = text_value("BEFORE: %+.0f cd", front_raw_start);
+  pages[1][2] = text_value("AFTER:  %+.0f cd", front_raw_end);
+  pages[1][3] = text_value("DELTA:  %+.0f cd", front_raw_end - front_raw_start);
+  pages[1][4] = text_value("TRAVEL: %+.5f in", front_inches);
+  pages[1][5] = text_value("EXPECT: %+.5f in", front_expected);
+  pages[1][6] = "cd = 1/100 degree";
+
+  pages[2][0] = "3/8 RIGHT RAW";
+  pages[2][1] = text_value("BEFORE: %+.0f cd", right_raw_start);
+  pages[2][2] = text_value("AFTER:  %+.0f cd", right_raw_end);
+  pages[2][3] = text_value("DELTA:  %+.0f cd", right_raw_end - right_raw_start);
+  pages[2][4] = text_value("TRAVEL: %+.5f in", right_inches);
+  pages[2][5] = text_value("EXPECT: %+.5f in", right_expected);
+  pages[2][6] = "36000 cd = 1 rev";
+
+  pages[3][0] = "4/8 IMU HEADING";
+  pages[3][1] = text_value("BEFORE: %.4f deg", imu_start);
+  pages[3][2] = text_value("AFTER:  %.4f deg", imu_end);
+  pages[3][3] = text_value("CHANGE: %+.4f deg", imu_end - imu_start);
+  pages[3][4] = text_value("CHANGE: %+.6f rad", heading_delta_rad);
+  pages[3][5] = "Unwrapped EZ IMU";
+  pages[3][6] = "Saved after settling";
+
+  pages[4][0] = "5/8 FRONT CONFIG";
+  pages[4][1] = text_value("PORT: %.0f / FRONT", front->smart_encoder.get_port());
+  pages[4][2] = text_value("OFFSET: %+.4f in", front->distance_to_center_get());
+  pages[4][3] = text_value("REVERSED: %.0f", front->smart_encoder.get_reversed());
+  pages[4][4] = text_value("OFFSET FLIP: %.0f", front->distance_to_center_flip_get());
+  pages[4][5] = "0 = NO / 1 = YES";
+  pages[4][6] = "Flags, not direction proof";
+
+  pages[5][0] = "6/8 RIGHT CONFIG";
+  pages[5][1] = text_value("PORT: %.0f / RIGHT", right->smart_encoder.get_port());
+  pages[5][2] = text_value("OFFSET: %+.4f in", right->distance_to_center_get());
+  pages[5][3] = text_value("REVERSED: %.0f", right->smart_encoder.get_reversed());
+  pages[5][4] = text_value("OFFSET FLIP: %.0f", right->distance_to_center_flip_get());
+  pages[5][5] = "0 = NO / 1 = YES";
+  pages[5][6] = "Flags, not direction proof";
+
+  pages[6][0] = "7/8 FRONT SCALE";
+  pages[6][1] = text_value("DIAMETER: %.4f in", front->wheel_diameter_get());
+  pages[6][2] = text_value("GEAR RATIO: %.4f", front->ratio_get());
+  pages[6][3] = text_value("TICKS/REV: %.0f", front->ticks_per_rev_get());
+  pages[6][4] = text_value("TICKS/IN: %.4f", front_tpi);
+  pages[6][5] = "Raw = sensor position";
+  pages[6][6] = "Snapshot: no live updates";
+
+  pages[7][0] = "8/8 RIGHT SCALE";
+  pages[7][1] = text_value("DIAMETER: %.4f in", right->wheel_diameter_get());
+  pages[7][2] = text_value("GEAR RATIO: %.4f", right->ratio_get());
+  pages[7][3] = text_value("TICKS/REV: %.0f", right->ticks_per_rev_get());
+  pages[7][4] = text_value("TICKS/IN: %.4f", right_tpi);
+  pages[7][5] = text_value("STDOUT FLUSH: %.0f", terminal_flush_status);
+  pages[7][6] = text_value("STDOUT ERROR: %.0f", terminal_error_flag);
+  page = 0;
+  pages_ready = true;
+  show_page();
+  page_mutex.give();
+  // Bypass the legacy LCD button callbacks. The entire 480x240 touch surface
+  // is two large navigation zones. Count new presses, not held samples.
+  // This task only draws frozen strings; it never issues a motion or pose reset.
+  static pros::Task diagnostic_touch_task([]() {
+    std::int32_t last_press = pros::screen::touch_status().press_count;
+    while (true) {
+      const auto touch = pros::screen::touch_status();
+      if (touch.touch_status != pros::E_TOUCH_ERROR) {
+        const bool new_press = touch.press_count != last_press;
+        last_press = touch.press_count;
+        if (new_press && touch.x >= 0 && touch.x < 480 &&
+            touch.y >= 0 && touch.y < 240) {
+          page_mutex.take();
+          if (pages_ready && odom_diagnostic_screen_is_active()) {
+            page = (page + (touch.x < 240 ? 7 : 1)) % 8;
+            for (int line = 0; line < 8; ++line)
+              pros::lcd::set_text(line, pages[page][line]);
+          }
+          page_mutex.give();
+        }
+      }
+      pros::delay(25);
+    }
+  }, "Odom diagnostic touch");
+  (void)diagnostic_touch_task;
+  // No further motion. The diagnostic screen remains latched until driver mode.
+}
+
+void odom_forward_24_test() {
+  diagnostic_screen_active.store(true);
+  pros::delay(60);
+  for (int line = 0; line < 8; ++line) pros::lcd::set_text(line, "");
+  pros::lcd::set_text(0, "OLD-FRAME +24 IN TEST");
+  pros::lcd::set_text(1, "Target: X 0 / Y 24 in");
+  pros::lcd::set_text(2, "RUNNING - SPEED 60");
+
+  chassis.drive_set(0, 0);
+  chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
+  chassis.pid_targets_reset();
+  chassis.drive_sensor_reset();
+  chassis.odom_xyt_set(0_in, 0_in, 0_deg);
+  pros::delay(50);
+  // Drive distance independently of the tracking-wheel geometry under test.
+  chassis.pid_drive_set(24_in, 60);
+  chassis.pid_wait();
+  chassis.drive_set(0, 0);
+  pros::delay(250);
+  const auto pose = chassis.odom_pose_get();
+  pros::lcd::print(2, "X: %+.3f in", pose.x);
+  pros::lcd::print(3, "Y: %+.3f in", pose.y);
+  pros::lcd::print(4, "THETA: %.3f deg", pose.theta);
+  pros::lcd::print(5, "Y ERROR: %+.3f in", pose.y - 24.0);
+  pros::lcd::set_text(6, "STOPPED - SPEED 60");
+  pros::lcd::set_text(7, "Actual odometry retained");
+  std::printf("\nINTERNAL / OLD-FRAME +24 IN | speed 60 | target X 0 Y 24 theta 0\n");
+  std::printf("Final X %+.3f in | Y %+.3f in | theta %.3f deg | Y error %+.3f in\n",
+              pose.x, pose.y, pose.theta, pose.y - 24.0);
+  std::fflush(stdout);
+}
+
+namespace {
+void test_screen_begin(const char* title) {
+  chassis.drive_set(0, 0);
+  diagnostic_screen_active.store(true);
+  pros::delay(60);  // Allow an in-progress normal display refresh to finish.
+  for (int line = 0; line < 8; ++line) pros::lcd::set_text(line, "");
+  pros::lcd::set_text(0, title);
+}
+
+void test_screen_finish() {
+  chassis.drive_set(0, 0);
+  pros::delay(250);  // Capture the settled pose without resetting odometry.
+  const auto pose = nav_pose_get();
+  for (int line = 1; line < 8; ++line) pros::lcd::set_text(line, "");
+  pros::lcd::print(1, "X: %+.3f in", pose.x);
+  pros::lcd::print(2, "Y: %+.3f in", pose.y);
+  pros::lcd::print(3, "CLAW THETA: %.3f deg", pose.theta);
+  pros::lcd::set_text(4, "STOPPED - FINAL POSE");
+  pros::lcd::set_text(5, "Photograph these values");
+}
+}  // namespace
+
+void test_go_to(double x, double y, int speed) {
+  test_screen_begin("TEST: GO TO");
+  pros::lcd::print(1, "X: %.1f in", x);
+  pros::lcd::print(2, "Y: %.1f in", y);
+  pros::lcd::print(3, "SPEED: %d", speed);
   pros::delay(1000);
-  outtake_on();
+  nav_go_to(x, y, speed);
+  test_screen_finish();
+}
+
+void test_go_to_pose(double x, double y, double theta, int speed) {
+  test_screen_begin("TEST: GO TO POSE");
+  pros::lcd::print(1, "X: %.1f in", x);
+  pros::lcd::print(2, "Y: %.1f in", y);
+  pros::lcd::print(3, "THETA: %.1f deg", theta);
+  pros::lcd::print(4, "SPEED: %d", speed);
   pros::delay(1000);
-  intake_stop();
+  nav_go_to_pose(x, y, theta, speed);
+  test_screen_finish();
 }
 
-// Runs all placeholder mechanisms briefly for wiring and port checks.
-void full_system_test() {
-  intake_on();
-  pros::delay(500);
-  intake_stop();
-
-  clamp_toggle();
-  pros::delay(500);
-  descore_toggle();
-  pros::delay(500);
-
-  lift_up();
-  pros::delay(500);
-  lift_down();
-  pros::delay(500);
-  lift_stop();
-
-  scoring_on();
-  pros::delay(500);
-  scoring_reverse();
-  pros::delay(500);
-  scoring_stop();
-}
-
-// Tests that +Y is forward and returning to (0, 0) uses the fixed origin.
-void odom_forward_absolute_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_go_to(0, 24, 80);
-  nav_print_pose();
-  pros::delay(500);
-
-  nav_go_to_reverse(0, 0, 80);
-  nav_print_pose();
-}
-
-// Tests fixed absolute coordinates by driving a square from the start origin.
-void odom_square_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_go_to(0, 24, 80);
-  nav_print_pose();
-
-  nav_go_to(24, 24, 80);
-  nav_print_pose();
-
-  nav_go_to(24, 0, 80);
-  nav_print_pose();
-
-  nav_go_to(0, 0, 80);
-  nav_print_pose();
-}
-
-// Tests absolute heading control at the four cardinal directions.
-void odom_turn_accuracy_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_turn_to(90, 70);
-  nav_print_pose();
-
-  nav_turn_to(180, 70);
-  nav_print_pose();
-
-  nav_turn_to(270, 70);
-  nav_print_pose();
-
-  nav_turn_to(0, 70);
-  nav_print_pose();
-}
-
-// Prints distance readings only. Use this first after sensors are installed.
-void distance_debug_test() {
-  dist_print_debug();
+void test_turn_to(double theta, int speed) {
+  test_screen_begin("TEST: TURN");
+  pros::lcd::print(1, "TARGET: %.1f deg", theta);
+  pros::lcd::print(2, "SPEED: %d", speed);
   pros::delay(1000);
+  nav_turn_to(theta, speed);
+  test_screen_finish();
 }
 
-// Tests front-distance correction to a placeholder 10 inch target.
-void distance_front_correct_test() {
-  // TODO: Tune this target distance after the actual front mechanism is built.
-  dist_print_debug();
-  dist_correct_front_distance(10.0, 1.0, 40, 2000);
-  nav_print_pose();
-}
-
-// Tests squaring to a flat wall or object using both front distance sensors.
-void distance_square_test() {
-  // TODO: Flip DIST_SQUARE_TURN_SIGN in distance_correction.cpp if turn direction is wrong.
-  dist_square_to_front_surface(1.0, 35, 2000);
-  nav_print_pose();
-}
-
-// Test routine only: odom drives first, then distance trims final spacing.
-void odom_then_distance_correct_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_go_to(0, 24, 70);
-  nav_print_pose();
-
-  // TODO: Tune this 10 inch placeholder after real scoring geometry is known.
-  dist_correct_front_distance(10.0, 1.0, 40, 2000);
-  nav_print_pose();
-}
-
-// Prints every distance sensor reading without moving the robot.
-void back_distance_debug_test() {
-  dist_print_debug();
+void test_drive_distance(double inches, int speed) {
+  test_screen_begin("TEST: DRIVE DISTANCE");
+  pros::lcd::print(1, "DISTANCE: %.1f in", inches);
+  pros::lcd::print(2, "SPEED: %d", speed);
   pros::delay(1000);
+  nav_drive_distance(inches, speed);
+  test_screen_finish();
 }
 
-// Tests back distance correction to a placeholder scoring distance.
-void back_distance_correct_test() {
-  // TODO: Tune this target after the real back scoring geometry is built.
-  dist_correct_back_distance(10.0, 1.0, 40, 2000);
+// Temporary read-only screen trace; no sensor, pose, or motion writes.
+void odom_trace_screen_show(const char* label) {
+  const auto internal = chassis.odom_pose_get();
+  const auto game = nav_internal_to_game_pose(internal);
+  const double imu = chassis.drive_imu_get();
+  if (!diagnostic_screen_active.exchange(true)) pros::delay(60);
+  for (int line = 0; line < 8; ++line) pros::lcd::set_text(line, "");
+  pros::lcd::set_text(0, label);
+  pros::lcd::print(1, "PUBLIC X/Y/H: %.2f %.2f %.2f", game.x, game.y, game.theta);
+  pros::lcd::print(2, "EZ X/Y/H: %.2f %.2f %.2f", internal.x, internal.y, internal.theta);
+  pros::lcd::print(3, "IMU H: %.3f", imu);
+}
+void odom_start_screen_test() {
+  diagnostic_screen_active.store(true);
+  pros::delay(60);  // Let an in-progress normal screen refresh finish.
+  auto show_headings = [](const char* label) {
+    const auto ez_pose = chassis.odom_pose_get();
+    const auto public_pose = nav_internal_to_game_pose(ez_pose);
+    const double imu_heading = chassis.drive_imu_get();
+    for (int line = 0; line < 8; ++line) pros::lcd::set_text(line, "");
+    pros::lcd::set_text(0, label);
+    pros::lcd::print(1, "PUBLIC H: %.4f", public_pose.theta);
+    pros::lcd::print(2, "EZ INTERNAL H: %.4f", ez_pose.theta);
+    pros::lcd::print(3, "IMU H: %.4f", imu_heading);
+    pros::lcd::set_text(5, "NAV_SET_START SNAPSHOT");
+    pros::lcd::set_text(6, "NO MOTION TEST");
+  };
+
+  show_headings("BEFORE");
+  pros::delay(2000);
+  nav_set_start(0.0, 0.0, 0.0);
+  pros::delay(250);
+  show_headings("AFTER");
+  pros::lcd::set_text(7, "Photograph this result");
+  pros::delay(10000);
+  // Leave AFTER latched; existing opcontrol() releases the diagnostic screen.
+}
+void odom_frame_exit_test() {
+  nav_set_start(0.0, 0.0, 0.0);
+  const auto ez_before = chassis.odom_pose_get();
+  const auto public_before = nav_internal_to_game_pose(ez_before);
+  std::printf("PUBLIC BEFORE MOVE:\nX = %.6f\nY = %.6f\nH = %.6f\n"
+              "EZ BEFORE MOVE:\nX = %.6f\nY = %.6f\nH = %.6f\n",
+              public_before.x, public_before.y, public_before.theta,
+              ez_before.x, ez_before.y, ez_before.theta);
+  // Do not start this physical test with a stale or invalid heading/pose.
+  const double imu_heading = chassis.drive_imu_get();
+  if (!nav_validate_pose(0.0, 0.0, 0.0, 0.5, 0.5) ||
+      !std::isfinite(imu_heading) ||
+      std::fabs(wrapped_angle_error(180.0, imu_heading)) > 0.5) {
+    std::printf("TEST ABORTED: start pose readback does not match (0,0,0).\n");
+    std::fflush(stdout);
+    return;
+  }
+  nav_go_to(12.0, 0.0, 30);
+  const auto ez_after = chassis.odom_pose_get();
+  const auto public_after = nav_internal_to_game_pose(ez_after);
+  std::printf("PUBLIC AFTER MOVE:\nX = %.6f\nY = %.6f\nH = %.6f\n"
+              "EZ AFTER MOVE:\nX = %.6f\nY = %.6f\nH = %.6f\n",
+              public_after.x, public_after.y, public_after.theta,
+              ez_after.x, ez_after.y, ez_after.theta);
+  std::fflush(stdout);
+}
+
+void odom_clean_point_test() {
+  struct Sample {
+    std::uint32_t time;
+    ez::pose pose;
+  };
+  struct Telemetry {
+    std::atomic<bool> running{true};
+    std::uint32_t start = 0;
+    std::vector<Sample> samples;
+  };
+  // Shared ownership keeps storage valid even if competition deletes autonomous.
+  // Bound recording to 30 seconds, and exit on a competition mode change.
+  auto data = std::make_shared<Telemetry>();
+  data->samples.reserve(1201);
+  nav_set_start(0.0, 0.0, 0.0);
+  const auto initial_pose = nav_pose_get();
+  const auto mode = pros::competition::get_status();
+  pros::Task telemetry([data, mode]() {
+    if (!pros::Task::notify_take(true, 1000)) return;
+    while (data->running.load() &&
+           pros::competition::get_status() == mode) {
+      const auto elapsed = pros::millis() - data->start;
+      if (elapsed >= 30000) break;
+      data->samples.push_back({elapsed, nav_pose_get()});
+      pros::delay(25);
+    }
+  }, "Clean point telemetry");
+
+  data->start = pros::millis();
+  telemetry.notify();
+  nav_go_to(0.0, 24.0, 70);
+  const auto movement_time = pros::millis() - data->start;
+  data->running.store(false);
+  const auto final_pose = nav_pose_get();
+  chassis.drive_set(0, 0);
+  telemetry.join();  // No worker accesses the samples while they are printed.
+
+  double max_cross_track = 0.0;
+  double max_heading_error = 0.0;
+  auto print_sample = [&](std::uint32_t time, ez::pose pose) {
+    const double dx = -pose.x;
+    const double dy = 24.0 - pose.y;
+    const double remaining = std::hypot(dx, dy);
+    // Public navigation convention: 0 = +Y, 90 = +X.
+    // Bearing is undefined at the target; emit NaN and exclude it from the max.
+    double bearing = NAN;
+    double heading_error = NAN;
+    if (remaining > 1e-6) {
+      bearing = std::atan2(dx, dy) * 180.0 / std::acos(-1.0);
+      if (bearing < 0.0) bearing += 360.0;
+      heading_error = wrapped_angle_error(bearing, pose.theta);
+      if (std::fabs(heading_error) > max_heading_error)
+        max_heading_error = std::fabs(heading_error);
+    }
+    if (std::fabs(pose.x) > max_cross_track)
+      max_cross_track = std::fabs(pose.x);
+    std::printf("%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                static_cast<unsigned long>(time), pose.x, pose.y, pose.theta,
+                pose.x, remaining, bearing, heading_error);
+  };
+  std::printf("\ntime_ms,x_in,y_in,heading_deg,cross_track_in,remaining_in,"
+              "desired_heading_deg,heading_error_deg\n");
+  print_sample(0, initial_pose);
+  for (const auto& sample : data->samples) {
+    if (sample.time <= movement_time) print_sample(sample.time, sample.pose);
+  }
+  print_sample(movement_time, final_pose);
+  std::printf("\n=== ODOM CLEAN POINT TEST ===\n"
+              "TARGET X: 0.00\nTARGET Y: 24.00\n"
+              "FINAL X: %.3f\nFINAL Y: %.3f\nFINAL HEADING: %.3f\n"
+              "X ERROR: %.3f\nY ERROR: %.3f\nTOTAL POSITION ERROR: %.3f\n"
+              "MAX ABS CROSS-TRACK ERROR: %.3f\n"
+              "MAX ABS HEADING ERROR: %.3f\nMOVEMENT TIME MS: %lu\n"
+              "=============================\n",
+              final_pose.x, final_pose.y, final_pose.theta, final_pose.x,
+              final_pose.y - 24.0, std::hypot(final_pose.x, final_pose.y - 24.0),
+              max_cross_track, max_heading_error,
+              static_cast<unsigned long>(movement_time));
+  if (movement_time >= 30000)
+    std::printf("NOTE: periodic telemetry capped at 30000 ms; maxima cover recorded samples only.\n");
+  std::fflush(stdout);
+}
+
+void odom_first_coordinate_test() {
+  nav_go_to(0.0, 24.0, 60);
+  chassis.drive_set(0, 0);
   nav_print_pose();
 }
 
-// Tests back squaring against a flat goal, wall, or practice target.
-void back_distance_square_test() {
-  // TODO: Flip DIST_BACK_SQUARE_TURN_SIGN if the robot turns the wrong way.
-  dist_square_to_back_surface(1.0, 35, 2000);
+void odom_forward_return_test() {
+  nav_go_to(0.0, 24.0, 80);
+  nav_go_to_reverse(0.0, 0.0, 80);
+  chassis.drive_set(0, 0);
   nav_print_pose();
 }
 
-// Tests scoring-side alignment without running the final scoring mechanism.
-void back_scoring_alignment_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_go_to_reverse(0, 24, 70);
-  nav_square_to_back_surface(1.0, 35, 2000);
-  nav_correct_back_distance(10.0, 1.0, 40, 2000);
-  nav_print_pose();
-
-  // scoring_on();  // Add later after scoring geometry and mechanism are proven.
-}
-
-// Tests correcting only X from a side wall/reference using a placeholder target.
-void side_distance_x_reset_test() {
-  nav_set_start(0, 0, 0);
-  dist_print_debug();
-
-  // TODO: Replace 48 and 6 with a real wall coordinate and sensor offset.
-  nav_reset_x_with_right_distance(48.0, 6.0, true);
+void odom_two_point_coordinate_test() {
+  nav_go_to(0.0, 24.0, 80);
+  nav_go_to(24.0, 24.0, 80);
+  chassis.drive_set(0, 0);
   nav_print_pose();
 }
-
-// Tests fast chained travel, then finishes with a precise non-chained pose.
-void chained_motion_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_chain_to(0, 24, 100);
-  nav_chain_to(24, 24, 100);
-  nav_precise_to_pose(24, 0, 180);
-  nav_print_pose();
-}
-
-// Tests fast travel near a goal followed by a precise reverse back approach.
-void precise_back_approach_test() {
-  nav_set_start(0, 0, 0);
-
-  nav_fast_to(0, 18);
-  nav_precise_to_pose_reverse(0, 30, 180);
-
-  // Optional once sensors are mounted:
-  // nav_square_to_back_surface(1.0, 35, 2000);
-  // nav_correct_back_distance(10.0, 1.0, 40, 2000);
-  nav_print_pose();
-}
-
-// . . .
-// Future autonomous routines go here.
-// . . .

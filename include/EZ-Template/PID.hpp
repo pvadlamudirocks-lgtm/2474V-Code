@@ -222,6 +222,9 @@ class PID {
    *        if true, prints when complete
    */
   ez::exit_output exit_condition(std::vector<pros::Motor> sensor, bool print = false);
+  // Temporary native TURN branch tracing; same decisions and timers as v3.2.2.
+  ez::exit_output exit_condition_turn_trace(std::vector<pros::Motor> sensor, bool print = false);
+  ez::exit_output exit_condition_turn_trace(bool print);
 
   /**
    * Iterative exit condition for PID.
@@ -283,6 +286,8 @@ class PID {
   long prev_time = 0;
 
  private:
+  // Preserve the native current timer while waiting for the final PP waypoint.
+  friend struct MotionExitTrace;
   double velocity_zero_main = 0.05;
   double velocity_zero_secondary = 0.075;
   int i = 0, j = 0, k = 0, l = 0, m = 0;

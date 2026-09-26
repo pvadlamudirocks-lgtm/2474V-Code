@@ -1,0 +1,161 @@
+#include "main.h"
+
+#include "autons.hpp"
+#include "navigation.hpp"
+
+namespace {
+constexpr int HORIZONTAL_TRACKER_PORT = 5;
+constexpr int VERTICAL_TRACKER_PORT = 7;
+constexpr int IMU_PORT = 20;
+
+constexpr double TRACKING_WHEEL_DIAMETER_IN = 2.00;
+constexpr double HORIZONTAL_TRACKER_OFFSET_IN = 0.25;
+constexpr double VERTICAL_TRACKER_OFFSET_IN = 0.50;
+constexpr double TRACKER_GEAR_RATIO = 1.0;
+
+constexpr double TURN_MULTIPLIER = 1.30;
+constexpr double DRIVER_ACTIVE_BRAKE_KP = 2.0;
+constexpr int DRIVER_DEADZONE = 5;
+constexpr int DRIVER_LOOP_MS = 10;
+constexpr int ODOM_DISPLAY_REFRESH_MS = 50;
+
+bool imu_calibrated = false;
+
+int apply_driver_deadzone(int input) {
+  if (input >= -DRIVER_DEADZONE && input <= DRIVER_DEADZONE)
+    return 0;
+  return input;
+}
+
+int clamp_driver_output(double output) {
+  if (output > 127.0)
+    return 127;
+  if (output < -127.0)
+    return -127;
+  return static_cast<int>(output);
+}
+
+void driver_arcade_control(int forward_input, int turn_input) {
+  const int forward = apply_driver_deadzone(forward_input);
+  const int turn = apply_driver_deadzone(turn_input);
+  const int amplified_turn = clamp_driver_output(turn * TURN_MULTIPLIER);
+  const int left_output = clamp_driver_output(forward + amplified_turn);
+  const int right_output = clamp_driver_output(forward - amplified_turn);
+
+  chassis.opcontrol_joystick_threshold_iterate(left_output, right_output);
+}
+
+void clear_brain_lines() {
+  for (int line = 0; line < 8; ++line)
+    pros::lcd::set_text(line, "");
+}
+
+void display_odom_pose() {
+  if (!imu_calibrated) {
+    pros::lcd::set_text(0, "IMU CALIBRATION FAILED");
+    return;
+  }
+
+  pros::lcd::set_text(0, "ODOMETRY");
+  pros::lcd::print(1, "X:     %7.2f in", chassis.odom_x_get());
+  pros::lcd::print(2, "Y:     %7.2f in", chassis.odom_y_get());
+  pros::lcd::print(3, "THETA: %7.2f deg", chassis.odom_theta_get());
+}
+
+void odom_display_task() {
+  while (true) {
+    display_odom_pose();
+    pros::delay(ODOM_DISPLAY_REFRESH_MS);
+  }
+}
+
+void reset_trusted_origin() {
+  chassis.pid_targets_reset();
+  chassis.drive_imu_reset();
+  chassis.drive_sensor_reset();
+  nav_set_start(0.0, 0.0, 0.0);
+}
+}  // namespace
+
+ez::Drive chassis(
+    {1, -4},          // Left drive: verified motor directions.
+    {3, -2},          // Right drive: verified motor directions.
+    IMU_PORT,         // Real inertial sensor on Smart Port 20.
+    2.75,             // Drive-wheel diameter in inches.
+    600,              // Blue motor cartridge speed in RPM.
+    600.0 / 450.0);   // External ratio for 450 RPM wheel speed.
+
+// Negative Smart Port 5 reverses only the horizontal Rotation Sensor so right
+// travel is positive. Offset arguments are positive physical magnitudes; the
+// front/left attachment methods below apply EZ-Template's side convention.
+ez::tracking_wheel horizontal_tracker(-HORIZONTAL_TRACKER_PORT,
+                                      TRACKING_WHEEL_DIAMETER_IN,
+                                      HORIZONTAL_TRACKER_OFFSET_IN,
+                                      TRACKER_GEAR_RATIO);
+ez::tracking_wheel vertical_tracker(VERTICAL_TRACKER_PORT,
+                                    TRACKING_WHEEL_DIAMETER_IN,
+                                    VERTICAL_TRACKER_OFFSET_IN,
+                                    TRACKER_GEAR_RATIO);
+
+pros::Controller master(pros::E_CONTROLLER_MASTER);
+
+void initialize() {
+  pros::lcd::initialize();
+  clear_brain_lines();
+
+  chassis.odom_tracker_front_set(&horizontal_tracker);
+  chassis.odom_tracker_left_set(&vertical_tracker);
+
+  chassis.opcontrol_curve_buttons_toggle(false);
+  chassis.opcontrol_curve_default_set(0.0, 0.0);
+  chassis.opcontrol_drive_activebrake_set(DRIVER_ACTIVE_BRAKE_KP);
+  default_constants();
+
+  chassis.initialize();
+  imu_calibrated = chassis.drive_imu_calibrated();
+  master.rumble(imu_calibrated ? "." : "---");
+
+  clear_brain_lines();
+  if (imu_calibrated)
+    reset_trusted_origin();
+  display_odom_pose();
+
+  static pros::Task odom_display_task_handle(odom_display_task);
+  (void)odom_display_task_handle;
+}
+
+void disabled() {
+}
+
+void competition_initialize() {
+}
+
+void autonomous() {
+  if (!imu_calibrated) {
+    chassis.drive_set(0, 0);
+    return;
+  }
+
+  chassis.pid_targets_reset();
+  chassis.drive_imu_reset();
+  chassis.drive_sensor_reset();
+  odom_first_coordinate_test();
+  chassis.drive_set(0, 0);
+}
+
+void opcontrol() {
+  chassis.drive_brake_set(MOTOR_BRAKE_BRAKE);
+
+  while (true) {
+    if (imu_calibrated &&
+        master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
+      reset_trusted_origin();
+    }
+
+    const int left_y = master.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+    const int right_x = master.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+    driver_arcade_control(left_y, right_x);
+
+    pros::delay(DRIVER_LOOP_MS);
+  }
+}

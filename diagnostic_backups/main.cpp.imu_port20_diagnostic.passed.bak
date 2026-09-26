@@ -1,0 +1,144 @@
+#include "api.h"
+
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+
+namespace {
+constexpr std::uint8_t IMU_PORT = 20;
+constexpr int DISPLAY_REFRESH_MS = 50;
+constexpr int DEBUG_PRINT_INTERVAL_CYCLES = 10;
+
+// This is the only object that claims Smart Port 20 in the diagnostic build.
+pros::Imu imu(20);
+std::int32_t reset_result = 0;
+
+void clear_brain_lines() {
+  for (int line = 0; line < 8; ++line)
+    pros::lcd::set_text(line, "");
+}
+
+void show_reset_failure(int error_number) {
+  clear_brain_lines();
+  pros::lcd::print(0, "IMU PORT: %d", IMU_PORT);
+  pros::lcd::set_text(1, "RESET FAILED");
+  pros::lcd::print(2, "RESET: %ld", static_cast<long>(reset_result));
+  pros::lcd::print(3, "ERRNO: %d", error_number);
+
+  std::printf("IMU RESET FAILED | port=%d reset=%ld errno=%d\n", IMU_PORT,
+              static_cast<long>(reset_result), error_number);
+}
+
+void imu_display_task() {
+  int debug_print_cycles = 0;
+
+  while (true) {
+    errno = 0;
+    const bool calibrating = imu.is_calibrating();
+    const int calibrating_errno = errno;
+
+    errno = 0;
+    const double rotation = imu.get_rotation();
+    const int rotation_errno = errno;
+
+    errno = 0;
+    const double heading = imu.get_heading();
+    const int heading_errno = errno;
+
+    errno = 0;
+    const int raw_status = static_cast<int>(imu.get_status());
+    const int status_errno = errno;
+
+    const bool rotation_valid = std::isfinite(rotation);
+    const bool heading_valid = std::isfinite(heading);
+    const bool working =
+        reset_result == 1 && !calibrating && rotation_valid && heading_valid;
+
+    int displayed_errno = calibrating_errno;
+    if (displayed_errno == 0) displayed_errno = rotation_errno;
+    if (displayed_errno == 0) displayed_errno = heading_errno;
+    if (displayed_errno == 0) displayed_errno = status_errno;
+
+    pros::lcd::print(0, "IMU PORT: %d", IMU_PORT);
+    pros::lcd::print(1, "RESET: %ld", static_cast<long>(reset_result));
+    pros::lcd::print(2, "CAL: %d", calibrating ? 1 : 0);
+    if (rotation_valid)
+      pros::lcd::print(3, "ROT:  %8.2f", rotation);
+    else
+      pros::lcd::set_text(3, "ROT: INVALID");
+    if (heading_valid)
+      pros::lcd::print(4, "HEAD: %8.2f", heading);
+    else
+      pros::lcd::set_text(4, "HEAD: INVALID");
+    pros::lcd::print(5, "ERRNO: %d", displayed_errno);
+
+    ++debug_print_cycles;
+    if (debug_print_cycles >= DEBUG_PRINT_INTERVAL_CYCLES) {
+      std::printf(
+          "IMU DEBUG | port=%d reset=%ld cal=%d rot=%.2f head=%.2f "
+          "errno=%d raw_status=%d working=%d\n",
+          IMU_PORT, static_cast<long>(reset_result), calibrating ? 1 : 0,
+          rotation, heading, displayed_errno, raw_status, working ? 1 : 0);
+      debug_print_cycles = 0;
+    }
+
+    pros::delay(DISPLAY_REFRESH_MS);
+  }
+}
+}  // namespace
+
+extern "C" {
+void initialize() {
+  pros::lcd::initialize();
+  clear_brain_lines();
+  pros::lcd::print(0, "IMU PORT: %d", IMU_PORT);
+  pros::lcd::set_text(1, "CALIBRATING...");
+  std::printf("IMU TEST | calibrating PROS IMU on Smart Port 20...\n");
+
+  errno = 0;
+  reset_result = imu.reset(true);
+  const int reset_errno = errno;
+  if (reset_result == PROS_ERR) {
+    show_reset_failure(reset_errno);
+    return;
+  }
+
+  if (reset_result != 1) {
+    clear_brain_lines();
+    pros::lcd::print(0, "IMU PORT: %d", IMU_PORT);
+    pros::lcd::set_text(1, "RESET UNEXPECTED");
+    pros::lcd::print(2, "RESET: %ld", static_cast<long>(reset_result));
+    pros::lcd::print(3, "ERRNO: %d", reset_errno);
+    std::printf("IMU RESET UNEXPECTED | reset=%ld errno=%d\n",
+                static_cast<long>(reset_result), reset_errno);
+    return;
+  }
+
+  clear_brain_lines();
+  pros::lcd::print(0, "IMU PORT: %d", IMU_PORT);
+  pros::lcd::set_text(1, "RESET SUCCESS");
+  pros::lcd::print(2, "RESET: %ld", static_cast<long>(reset_result));
+  pros::lcd::print(3, "ERRNO: %d", reset_errno);
+  std::printf("IMU RESET SUCCESS | port=%d reset=%ld errno=%d\n", IMU_PORT,
+              static_cast<long>(reset_result), reset_errno);
+  pros::delay(500);
+
+  static pros::Task imu_display_task_handle(imu_display_task);
+  (void)imu_display_task_handle;
+}
+
+void disabled() {
+}
+
+void competition_initialize() {
+}
+
+void autonomous() {
+}
+
+void opcontrol() {
+  while (true)
+    pros::delay(20);
+}
+}
