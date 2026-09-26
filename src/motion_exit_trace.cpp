@@ -193,8 +193,13 @@ extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v5
     // Linear acceleration is not a stall measurement for an in-place turn.
     // Scope the native toggle to this evaluation; other modes retain their setting.
     const bool secondary_enabled = pid->velocity_sensor_secondary_toggle_get();
+    const int velocity_exit_time = pid->exit.velocity_exit_time;
     pid->velocity_sensor_secondary_toggle_set(false);
+    // Skip both velocity branches only for this TURN evaluation. Discarding a
+    // VELOCITY_EXIT afterward would already have reset angular/current timers.
+    pid->exit.velocity_exit_time = 0;
     const auto result = pid->exit_condition_turn_trace(std::move(motors), print);
+    pid->exit.velocity_exit_time = velocity_exit_time;
     pid->velocity_sensor_secondary_toggle_set(secondary_enabled);
     turn_velocity_trace_record_result(result);  // Observe only; return the same native result.
     return result;

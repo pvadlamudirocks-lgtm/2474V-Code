@@ -10,3 +10,8 @@ void motion_controller_snapshot_start();
 void turn_velocity_trace_begin();
 void turn_velocity_trace_record_result(ez::exit_output result);
 ez::exit_output turn_velocity_trace_result();
+void final_turn_trace_arm(double public_target);
+void final_turn_trace_target(double ez_target);
+void final_turn_trace_exit(ez::exit_output result);
+void final_turn_trace_wait_returned();
+void final_turn_trace_nav_returned();

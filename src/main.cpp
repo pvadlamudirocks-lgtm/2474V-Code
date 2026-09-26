@@ -241,7 +241,9 @@ void autonomous() {
   std::fflush(stdout);
   motion_exit_trace_show();
 
+  final_turn_trace_arm(90.0);
   nav_turn_to(90.0, 20);
+  final_turn_trace_nav_returned();
   const auto corrected = nav_pose_get();
   std::printf("\n===== AFTER FINAL HEADING CORRECTION =====\n"
               "X = %.3f\nY = %.3f\nH = %.3f\n"

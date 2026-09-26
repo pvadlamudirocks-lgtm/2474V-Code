@@ -107,8 +107,11 @@ void nav_go_to_pose_reverse(double x_in, double y_in, double theta_deg,
 
 void nav_turn_to(double theta_deg, int speed) {
   turn_velocity_trace_begin();
-  chassis.pid_turn_set(nav_game_to_internal_heading(theta_deg), speed);
+  const double target = nav_game_to_internal_heading(theta_deg);
+  final_turn_trace_target(target);
+  chassis.pid_turn_set(target, speed);
   chassis.pid_wait();
+  final_turn_trace_wait_returned();
 }
 
 void nav_drive_distance(double inches, int speed) {

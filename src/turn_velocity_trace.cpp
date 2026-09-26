@@ -49,7 +49,10 @@ void turn_velocity_trace_begin() {
   trace_printed = false;
 }
 
-void turn_velocity_trace_record_result(ez::exit_output result) { last_turn_exit = result; }
+void turn_velocity_trace_record_result(ez::exit_output result) {
+  last_turn_exit = result;
+  final_turn_trace_exit(result);
+}
 ez::exit_output turn_velocity_trace_result() { return last_turn_exit; }
 
 exit_output PID::exit_condition_turn_trace(bool print) {
