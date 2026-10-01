@@ -116,6 +116,9 @@ struct AxisState {
 };
 AxisState lift;
 AxisState arm;
+bool returning_home = false;
+unsigned return_started_at = 0;
+bool return_started_in_autonomous = false;
 bool claw_is_open = false;
 bool flip_is_reverse = false; // Known normal software state; no startup toggle.
 bool claw_state_written = false;
@@ -137,6 +140,14 @@ double read_position(bool is_lift) {
 
 bool write_voltage(bool is_lift, int mv) {
   if (is_lift) {
+    if (mv < 0) {
+      const auto bottom = lift_bottom_limit_read();
+      if (bottom == LiftBottomLimit::Pressed || bottom == LiftBottomLimit::Fault) {
+        left_lift_motor().move_voltage(0);
+        right_lift_motor().move_voltage(0);
+        return bottom != LiftBottomLimit::Fault;
+      }
+    }
     // Issue BOTH writes even if one motor reports failure.
     const auto left_result = left_lift_motor().move_voltage(mv);
     const auto right_result = right_lift_motor().move_voltage(mv);
@@ -146,6 +157,7 @@ bool write_voltage(bool is_lift, int mv) {
 }
 
 void disable_axis(AxisState& axis, bool is_lift, bool fault = false) {
+  if (is_lift) returning_home = false;
   if (axis.initialized) write_voltage(is_lift, 0);
   axis.mode = fault ? AxisMode::Fault : AxisMode::Disabled;
   axis.manual_mv = 0;
@@ -209,6 +221,7 @@ bool zero_axis(AxisState& axis, bool is_lift) {
 }
 
 void capture_hold(AxisState& axis, bool is_lift) {
+  if (is_lift && returning_home) return;
   axis.manual_mv = 0;
   axis.settling = false;
   axis.settled = false;
@@ -238,6 +251,7 @@ int limit_voltage(const AxisState& axis, bool is_lift, double position, int mv) 
 }
 
 void manual_axis(AxisState& axis, bool is_lift, int direction) {
+  if (is_lift && returning_home) return;
   if (!axis.initialized || axis.mode == AxisMode::Fault) return;
   // Cancel automatic movement BEFORE checking the commissioning enable flag.
   // Manual state blocks target requests until explicit release or timeout.
@@ -263,7 +277,7 @@ void manual_axis(AxisState& axis, bool is_lift, int direction) {
 }
 
 bool target_allowed(const AxisState& axis, bool is_lift, double target) {
-  return feedback_ready(axis, is_lift) && limits_ready(is_lift) &&
+  return !(is_lift && returning_home) && feedback_ready(axis, is_lift) && limits_ready(is_lift) &&
          axis.mode != AxisMode::Manual && std::isfinite(target) &&
          target >= (is_lift ? LIFT_MIN_DEG : ARM_MIN_DEG) &&
          target <= (is_lift ? LIFT_MAX_DEG : ARM_MAX_DEG);
@@ -401,6 +415,7 @@ void update_object_detection() {
 } // namespace
 
 void lift_initialize() {
+  returning_home = false;
   home_switch = LiftHomeSwitchState{};
   initialize_axis(lift, true);
 }
@@ -416,7 +431,7 @@ void mechanisms_initialize() {
     claw_flip_forward(); // Explicit false, never toggle.
   }
 }
-bool lift_zero_at_current_position() { return zero_axis(lift, true); }
+bool lift_zero_at_current_position() { return !returning_home && zero_axis(lift, true); }
 bool arm_zero_at_current_position() { return zero_axis(arm, false); }
 void lift_manual_up() { manual_axis(lift, true, 1); }
 void lift_manual_down() { manual_axis(lift, true, -1); }
@@ -450,9 +465,70 @@ bool arm_move_score() {
 bool arm_move_max_lift_position() {
   return mechanism_config::ARM_SCORING_POSITIONS_CALIBRATED && arm_set_target(mechanism_config::ARM_MAX_LIFT_DEG);
 }
-void lift_update() { update_axis(lift, true); }
+LiftBottomLimit lift_bottom_limit_read() {
+  if (mechanism_config::LIFT_BOTTOM_LIMIT_PORT == 0)
+    return LiftBottomLimit::Unconfigured;
+  static_assert(mechanism_config::LIFT_BOTTOM_LIMIT_PORT == 0 ||
+                (mechanism_config::LIFT_BOTTOM_LIMIT_PORT >= 'A' &&
+                 mechanism_config::LIFT_BOTTOM_LIMIT_PORT <= 'H'),
+                "Select a real bottom switch ADI port A-H, or leave 0 unbound");
+  static pros::adi::DigitalIn input(mechanism_config::LIFT_BOTTOM_LIMIT_PORT);
+  const auto value = input.get_value();
+  if (value != 0 && value != 1) return LiftBottomLimit::Fault;
+  return (value != 0) == mechanism_config::LIFT_BOTTOM_LIMIT_PRESSED_VALUE
+             ? LiftBottomLimit::Pressed : LiftBottomLimit::Released;
+}
+bool lift_return_home_active() { return returning_home; }
+bool lift_return_home_start() {
+  using namespace mechanism_config;
+  if (returning_home) return true; // Repeated requests never restart the timer.
+  const auto bottom = lift_bottom_limit_read();
+  if (!lift.initialized || lift.mode == AxisMode::Fault ||
+      pros::competition::is_disabled() || !ENABLE_LIFT_MANUAL ||
+      !ENABLE_PNEUMATICS || LIFT_RETURN_TIMEOUT_MS == 0 ||
+      LIFT_MANUAL_MV <= 0 || LIFT_MANUAL_MV > 12000 ||
+      bottom == LiftBottomLimit::Unconfigured || bottom == LiftBottomLimit::Fault)
+    return false;
+  if (!write_voltage(true, 0)) { disable_axis(lift, true, true); return false; }
+  returning_home = true;
+  lift.mode = AxisMode::Disabled; // Existing target/hold must not compete.
+  lift.settled = false;
+  lift.manual_mv = 0;
+  return_started_at = lift.last_update = pros::millis();
+  return_started_in_autonomous = pros::competition::is_autonomous();
+  return true;
+}
+void lift_update() {
+  if (pros::competition::is_disabled()) { disable_axis(lift, true, lift.mode == AxisMode::Fault); return; }
+  if (!returning_home) { update_axis(lift, true); return; }
+  if (pros::competition::is_autonomous() != return_started_in_autonomous) {
+    disable_axis(lift, true);
+    return;
+  }
+  const unsigned now = pros::millis();
+  const auto bottom = lift_bottom_limit_read();
+  // Check the physical stop before any further downward output, every loop.
+  if (bottom == LiftBottomLimit::Pressed) {
+    // zero_axis first stops BOTH motors, then resets the reference ONCE.
+    // Never close the claw if stopping/zeroing fails.
+    if (zero_axis(lift, true) && !claw_close()) disable_axis(lift, true, true);
+    return;
+  }
+  if (bottom != LiftBottomLimit::Released ||
+      now - return_started_at >= mechanism_config::LIFT_RETURN_TIMEOUT_MS ||
+      now - lift.last_update > mechanism_config::MAX_UPDATE_GAP_MS ||
+      !std::isfinite(read_position(true))) {
+    disable_axis(lift, true, true); // Latched fault; no claw closure or auto-retry.
+    std::printf("Lift return fault: switch, sensor, timeout or update gap\n");
+    return;
+  }
+  lift.last_update = now;
+  if (!write_voltage(true, -mechanism_config::LIFT_MANUAL_MV))
+    disable_axis(lift, true, true);
+}
 void arm_update() { update_axis(arm, false); }
 void mechanisms_update() {
+  if (pros::competition::is_disabled()) { stop_all_mechanisms(); return; }
   lift_update();
   arm_update();
   update_lift_home_switch();
@@ -463,6 +539,7 @@ double arm_position_deg() { return read_position(false); }
 bool lift_at_target() { return at_target(lift, true); }
 bool arm_at_target() { return at_target(arm, false); }
 LiftMode lift_mode() {
+  if (returning_home) return LiftMode::ReturningHome;
   switch (lift.mode) {
     case AxisMode::Disabled: return LiftMode::Disabled;
     case AxisMode::Manual: return LiftMode::Manual;
@@ -483,6 +560,7 @@ ArmMode arm_mode() {
   return ArmMode::Fault;
 }
 bool claw_set(bool open) {
+  if (!open && returning_home) return false; // R1 cannot close during descent.
   if (!mechanism_config::ENABLE_PNEUMATICS) return false;
   const bool output = open ? mechanism_config::CLAW_OPEN_OUTPUT : !mechanism_config::CLAW_OPEN_OUTPUT;
   if (claw_piston().set_value(output) == PROS_ERR) {
@@ -514,10 +592,13 @@ bool claw_object_detected() {
   return object_detected && pros::millis() - last_distance_sample <= mechanism_config::MAX_UPDATE_GAP_MS;
 }
 bool mechanism_return_home() {
-  if (!mechanism_config::POST_SCORE_RESET_VERIFIED) return false;
-  if (!target_allowed(lift, true, mechanism_config::LIFT_HOME_DEG)) return false;
-  if (!claw_close()) return false;
-  return lift_move_home(); // Order of commands, not proof the cylinder finished.
+  return lift_return_home_start();
+}
+bool color_toggle_set(bool held) {
+  // TODO COLOR_TOGGLE_HARDWARE: bind the selected device here. Existing claw
+  // flip on ADI B has no evidence of being this mechanism; do not reuse its port.
+  (void)held;
+  return false; // Explicitly unavailable, never claim a hardware action succeeded.
 }
 void stop_all_mechanisms() {
   home_switch = LiftHomeSwitchState{};

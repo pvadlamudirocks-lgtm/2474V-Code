@@ -1,5 +1,6 @@
 #include "navigation.hpp"
 #include "motion_exit_trace.hpp"
+#include "path_motion_trace.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -87,10 +88,30 @@ void nav_go_to(double x_in, double y_in, int speed) {
   motion_exit_trace_finish();  // Captures before stopping; no-op unless armed.
 }
 
-void nav_go_to_pose(double x_in, double y_in, double theta_deg, int speed) {
-  chassis.pid_odom_set(
-      {nav_game_to_internal_pose({x_in, y_in, theta_deg}), ez::rev, speed});
+void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int speed) {
+  const auto target = nav_game_to_internal_pose({x_in, y_in, public_heading_deg});
+  const ez::odom movement{target, ez::rev, speed};  // Claw-leading, as in nav_go_to.
+  const bool interfered_before = chassis.interfered;
+  std::printf("\nPOSE requested PUBLIC = (%.3f, %.3f, %.3f deg)\n"
+              "POSE converted EZ = (%.3f, %.3f, %.3f deg) | EZ rev | speed %d\n",
+              x_in, y_in, public_heading_deg, target.x, target.y, target.theta, speed);
+  std::fflush(stdout);
+  pose_exit_trace_begin();
+  // Explicit single-pose API; uses the existing global slew/Boomerang settings.
+  chassis.pid_odom_boomerang_set(movement);
   chassis.pid_wait();
+  const auto final_pose = nav_pose_get();
+  const auto exits = pose_exit_trace_finish();
+  std::printf("POSE final PUBLIC = (%.3f, %.3f, %.3f deg) [at pid_wait return]\n"
+              "POSE position error = %.3f in | heading error (target-current) = %+.3f deg\n"
+              "POSE exit XY = %s | angular = %s | interference before/after = %s/%s\n",
+              final_pose.x, final_pose.y, final_pose.theta,
+              std::hypot(x_in - final_pose.x, y_in - final_pose.y),
+              angle_error(public_heading_deg, final_pose.theta),
+              ez::exit_to_string(exits.first).c_str(),
+              ez::exit_to_string(exits.second).c_str(),
+              interfered_before ? "true" : "false", chassis.interfered ? "true" : "false");
+  std::fflush(stdout);
 }
 
 void nav_go_to_reverse(double x_in, double y_in, int speed) {
@@ -120,6 +141,54 @@ void nav_drive_distance(double inches, int speed) {
   chassis.pid_wait();
 }
 
+namespace {
+bool follow_path(const std::vector<nav_waypoint>& waypoints, int speed,
+                 nav_path_direction direction, bool use_final_heading,
+                 double final_public_heading) {
+  if (waypoints.empty() || speed < 1 || speed > 127 ||
+      (direction != nav_path_direction::claw_forward &&
+       direction != nav_path_direction::claw_reverse) ||
+      (use_final_heading && !std::isfinite(final_public_heading))) {
+    return false;
+  }
+  // Validate the complete request before touching the controller.
+  for (const auto& point : waypoints) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
+  }
+
+  const auto ez_direction = direction == nav_path_direction::claw_forward
+                                ? ez::rev : ez::fwd;
+  std::vector<ez::odom> movements;
+  movements.reserve(waypoints.size());
+  for (const auto& point : waypoints) {
+    movements.push_back(
+        {nav_game_to_internal_pose({point.x, point.y}), ez_direction, speed});
+  }
+  if (use_final_heading) {
+    movements.back().target.theta =
+        nav_game_to_internal_heading(final_public_heading);
+  }
+  // Native injection + lookahead following; no custom path algorithm, per-point
+  // waits, tuning changes, or post-path turn. Global slew settings are retained.
+  path_motion_trace_begin(movements);  // No-op unless explicitly armed.
+  chassis.pid_odom_injected_pp_set(movements);
+  chassis.pid_wait();  // Retains the project's existing final-waypoint wait fix.
+  path_motion_trace_wait_returned();   // Capture only; never stops or prints.
+  return true;
+}
+}  // namespace
+
+bool nav_follow_path(const std::vector<nav_waypoint>& waypoints, int speed,
+                     nav_path_direction direction) {
+  return follow_path(waypoints, speed, direction, false, 0.0);
+}
+
+bool nav_follow_path_pose(const std::vector<nav_waypoint>& waypoints,
+                          double final_public_heading, int speed,
+                          nav_path_direction direction) {
+  return follow_path(waypoints, speed, direction, true, final_public_heading);
+}
+
 bool nav_validate_pose(double expected_x, double expected_y,
                        double expected_theta, double xy_tolerance,
                        double theta_tolerance) {
@@ -137,4 +206,62 @@ void nav_print_pose() {
   const auto pose = nav_pose_get();
   std::printf("Claw/game pose | x: %.2f in, y: %.2f in, claw/game theta: %.2f deg\n",
               pose.x, pose.y, pose.theta);
+}
+
+#include "nav_sequence.hpp"
+namespace {
+bool valid_motion(double x, double y, double h, int speed, NavEndMode end) {
+  if (!nav_ok()) return false;
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(h) || speed < 1 || speed > 127 ||
+      (end != NavEndMode::SETTLE && end != NavEndMode::CHAIN)) {
+    nav_abort("invalid movement"); return false;
+  }
+  return true;
+}
+bool sequence_path(const std::vector<nav_waypoint>& points, double h, int speed,
+                   NavEndMode end, nav_path_direction direction, bool pose) {
+  if (points.empty() || (direction != nav_path_direction::claw_forward && direction != nav_path_direction::claw_reverse)) {
+    nav_abort("invalid path"); return false;
+  }
+  if (pose && end == NavEndMode::CHAIN) { nav_abort("pose motion requires SETTLE"); return false; }
+  std::vector<ez::odom> movements;
+  for (const auto& p : points) {
+    if (!valid_motion(p.x,p.y,h,speed,end)) return false;
+    movements.push_back({nav_game_to_internal_pose({p.x,p.y}),
+      direction == nav_path_direction::claw_forward ? ez::rev : ez::fwd,speed});
+  }
+  if (pose) movements.back().target.theta = nav_game_to_internal_heading(h);
+  const ez::pose final{points.back().x,points.back().y,pose ? h : ez::ANGLE_NOT_SET};
+  return nav_detail::move([&]{ chassis.pid_odom_injected_pp_set(movements); },end,final);
+}
+}
+bool nav_follow_path(const std::vector<nav_waypoint>& points, int speed, NavEndMode end, nav_path_direction direction) {
+  return sequence_path(points,0,speed,end,direction,false);
+}
+bool nav_follow_path_pose(const std::vector<nav_waypoint>& points, double h, int speed, NavEndMode end, nav_path_direction direction) {
+  return sequence_path(points,h,speed,end,direction,true);
+}
+bool nav_go_to(double x, double y, int speed, NavEndMode end) {
+  return nav_follow_path({{x,y}},speed,end);
+}
+bool nav_go_to_reverse(double x, double y, int speed, NavEndMode end) {
+  return nav_follow_path({{x,y}},speed,end,nav_path_direction::claw_reverse);
+}
+bool nav_go_to_pose(double x, double y, double h, int speed, NavEndMode end) {
+  if (!valid_motion(x,y,h,speed,end)) return false;
+  if (end != NavEndMode::SETTLE) { nav_abort("pose motion requires SETTLE"); return false; }
+  return nav_detail::move([&]{ chassis.pid_odom_boomerang_set({nav_game_to_internal_pose({x,y,h}),ez::rev,speed}); },end,{x,y,h});
+}
+bool nav_go_to_pose_reverse(double x, double y, double h, int speed, NavEndMode end) {
+  if (!valid_motion(x,y,h,speed,end)) return false;
+  if (end != NavEndMode::SETTLE) { nav_abort("pose motion requires SETTLE"); return false; }
+  return nav_detail::move([&]{ chassis.pid_odom_boomerang_set({nav_game_to_internal_pose({x,y,h}),ez::fwd,speed}); },end,{x,y,h});
+}
+bool nav_turn_to(double h, int speed, NavEndMode end) {
+  if (!valid_motion(0,0,h,speed,end)) return false;
+  return nav_detail::move([&]{ chassis.pid_turn_set(nav_game_to_internal_heading(h),speed); },end,{0,0,h},0,false,true);
+}
+bool nav_drive_distance(double inches, int speed, NavEndMode end) {
+  if (!valid_motion(inches,0,0,speed,end)) return false;
+  return nav_detail::move([&]{ chassis.pid_drive_set(-inches,speed); },end,{0,0},inches,true,false);
 }

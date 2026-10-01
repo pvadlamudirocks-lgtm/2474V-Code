@@ -1,4 +1,8 @@
+#include "EZ-Template/navigation_hooks.hpp"
+#include "navigation.hpp"
+void nav_observe_exit(ez::exit_output result);
 #include "motion_exit_trace.hpp"
+#include "path_motion_trace.hpp"
 #include "autons.hpp"
 #include <cstdio>
 #include <cmath>
@@ -19,6 +23,8 @@ struct ExitEvent {
   Snapshot state;
 };
 bool armed = false, recording = false, previous_print = false;
+bool pose_recording = false;
+ez::exit_output pose_xy_exit = ez::RUNNING, pose_angle_exit = ez::RUNNING;
 bool interfered_before = false, interfered_after = false;
 std::uint32_t start_ms = 0;
 int event_order = 0;
@@ -134,7 +140,7 @@ struct MotionExitTrace {
   static bool wait_for_final_waypoint(Drive& drive) {
     if (drive.mode != PURE_PURSUIT || drive.pp_movements.empty()) return true;
     while (drive.pp_index != static_cast<int>(drive.pp_movements.size()) - 1) {
-      pros::delay(util::DELAY_TIME);
+      pros::delay(util::DELAY_TIME); if (!ez::wait_service_tick(&drive)) return false;
       const auto xy = current_only(drive.xyPID, drive);
       const auto angle = current_only(drive.current_a_odomPID, drive);
       if (&drive == &chassis) {
@@ -162,6 +168,11 @@ struct MotionExitTrace {
     return s;
   }
   static void observe(PID* pid, exit_output result) {
+    path_motion_trace_exit(pid, result);  // Observe the same result, never reevaluate.
+    if (pose_recording && result != RUNNING) {
+      if (pid == &chassis.xyPID && pose_xy_exit == RUNNING) pose_xy_exit = result;
+      if (pid == &chassis.current_a_odomPID && pose_angle_exit == RUNNING) pose_angle_exit = result;
+    }
     if (!recording || result == RUNNING) return;
     ExitEvent* event = pid == &chassis.xyPID ? &xy_event :
                        pid == &chassis.current_a_odomPID ? &angle_event : nullptr;
@@ -183,6 +194,16 @@ void motion_controller_snapshot_start() {
   }, "One-shot motion snapshot");
 }
 
+void pose_exit_trace_begin() {
+  pose_xy_exit = pose_angle_exit = ez::RUNNING;
+  pose_recording = true;
+}
+
+std::pair<ez::exit_output, ez::exit_output> pose_exit_trace_finish() {
+  pose_recording = false;
+  return {pose_xy_exit, pose_angle_exit};
+}
+
 // GNU ld --wrap observes the exact overload used by native Drive::pid_wait().
 // Forward exactly once, preserve its result, and never call exit_condition again.
 extern "C" ez::exit_output __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
@@ -201,11 +222,13 @@ extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v5
     const auto result = pid->exit_condition_turn_trace(std::move(motors), print);
     pid->exit.velocity_exit_time = velocity_exit_time;
     pid->velocity_sensor_secondary_toggle_set(secondary_enabled);
+    nav_observe_exit(result);
     turn_velocity_trace_record_result(result);  // Observe only; return the same native result.
     return result;
   }
   const auto result = __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
       pid, std::move(motors), print);
+  nav_observe_exit(result);
   ez::MotionExitTrace::observe(pid, result);
   return result;
 }
@@ -293,3 +316,5 @@ extern "C" void __wrap__ZN2ez5Drive8pid_waitEv(ez::Drive* drive) {
   if (!ez::MotionExitTrace::wait_for_final_waypoint(*drive)) return;
   ez_trace_native_pid_wait(drive);
 }
+
+

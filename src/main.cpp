@@ -5,7 +5,9 @@
 
 #include "autons.hpp"
 #include "navigation.hpp"
+#include "nav_sequence.hpp"
 #include "motion_exit_trace.hpp"
+#include "path_motion_trace.hpp"
 #include "subsystems.hpp"
 
 namespace {
@@ -21,12 +23,19 @@ constexpr double VERTICAL_TRACKER_OFFSET_IN = 0.152;
 constexpr double TRACKER_GEAR_RATIO = 1.0;
 
 constexpr double TURN_MULTIPLIER = 1.30;
-constexpr double DRIVER_ACTIVE_BRAKE_KP = 2.0;
+constexpr double DRIVER_ACTIVE_BRAKE_KP = 3.0;
 constexpr int DRIVER_DEADZONE = 5;
 constexpr int DRIVER_LOOP_MS = 10;
 constexpr int ODOM_DISPLAY_REFRESH_MS = 50;
 
 bool imu_calibrated = false;
+bool driver_coast_mode = false;
+void restore_driver_brakes() {
+  if (!driver_coast_mode) return;
+  chassis.opcontrol_drive_activebrake_set(DRIVER_ACTIVE_BRAKE_KP);
+  chassis.drive_brake_set(MOTOR_BRAKE_BRAKE);
+  driver_coast_mode = false;
+}
 pros::Mutex odom_display_mutex;
 bool odom_display_frozen = false;
 
@@ -197,66 +206,66 @@ void initialize() {
 }
 
 void disabled() {
+  stop_all_mechanisms();
+  restore_driver_brakes();
 }
 
 void competition_initialize() {
 }
 
+// Select ONE test per build: 0 = MODE A (XY), 1 = MODE B (final public H=90).
+constexpr int PATH_DIAGNOSTIC_MODE = 0;
+static_assert(PATH_DIAGNOSTIC_MODE == 0 || PATH_DIAGNOSTIC_MODE == 1,
+              "PATH_DIAGNOSTIC_MODE must be 0 (XY) or 1 (pose)");
+
+// -1 preserves the prior Pure Pursuit diagnostic; 0=A, 1=B chaining test.
+#ifndef MOTION_CHAIN_MODE
+#define MOTION_CHAIN_MODE 0
+#endif
+static_assert(MOTION_CHAIN_MODE >= -1 && MOTION_CHAIN_MODE <= 1,
+              "MOTION_CHAIN_MODE must be -1, 0, or 1");
 void autonomous() {
-  std::printf("EFFECTIVE HORIZONTAL OFFSET = %.3f\nEFFECTIVE VERTICAL OFFSET = %.3f\n",
-              horizontal_tracker.distance_to_center_get(), vertical_tracker.distance_to_center_get());
-  std::fflush(stdout);
+  stop_all_mechanisms(); // Discard any driver return before changing ownership.
+  restore_driver_brakes(); // Driver coast must not leak into autonomous.
+  if constexpr (MOTION_CHAIN_MODE >= 0) {
+    if (!imu_calibrated) return;
+    chassis.pid_drive_toggle(true);
+    motion_chaining_test(MOTION_CHAIN_MODE == 1);
+    return;
+  }
   if (!imu_calibrated) return;
+  chassis.drive_set(0, 0);
   chassis.pid_drive_toggle(true);
-  motion_exit_trace_arm();
-  nav_set_start(0.0, 0.0, 0.0);
-  const auto before_ez = chassis.odom_pose_get();
-  const auto before = nav_internal_to_game_pose(before_ez);
-  const double horizontal_before = horizontal_tracker.smart_encoder.get_position();
-  const double vertical_before = vertical_tracker.smart_encoder.get_position();
-  std::printf("\n===== BEFORE 12-IN +X MOVEMENT =====\n"
-              "PUBLIC X/Y/H = %.3f %.3f %.3f\nEZ X/Y/H = %.3f %.3f %.3f\n"
-              "raw horizontal = %.0f\nraw vertical = %.0f\n",
-              before.x, before.y, before.theta, before_ez.x, before_ez.y, before_ez.theta,
-              horizontal_before, vertical_before);
+  nav_set_start(0.0, 0.0, 0.0);  // Reset once, before the entire path.
+  const auto start = nav_pose_get();
+  std::printf("\n===== CONTROLLED PATH TEST: MODE %s =====\n"
+              "PUBLIC start X/Y/H=%.3f %.3f %.3f; claw must physically face +Y\n"
+              "Route: (0,10) -> (8,20) -> (20,20); claw-first; speed=127 throughout\n"
+              "Effective tracker offsets H=%.3f V=%.3f\n"
+              "lookahead=%.3f bias=%.3f boomerang_distance=%.3f dlead=%.3f\n"
+              "No terminal output during motion. Buffered trace follows measured rest.\n",
+              PATH_DIAGNOSTIC_MODE == 0 ? "A / XY" : "B / POSE H=90",
+              start.x, start.y, start.theta,
+              horizontal_tracker.distance_to_center_get(), vertical_tracker.distance_to_center_get(),
+              chassis.odom_look_ahead_get(), chassis.odom_turn_bias_get(),
+              chassis.odom_boomerang_distance_get(), chassis.odom_boomerang_dlead_get());
   std::fflush(stdout);
-
-  nav_go_to(12.0, 0.0, 30);
-
-  const auto after_ez = chassis.odom_pose_get();
-  const auto after = nav_internal_to_game_pose(after_ez);
-  std::printf("\n===== AFTER GO_TO =====\nX = %.3f\nY = %.3f\nH = %.3f\n",
-              after.x, after.y, after.theta);
-  std::fflush(stdout);
-  const double horizontal_after = horizontal_tracker.smart_encoder.get_position();
-  const double vertical_after = vertical_tracker.smart_encoder.get_position();
-  std::printf("\n===== AFTER 12-IN +X MOVEMENT =====\n"
-              "PUBLIC X/Y/H = %.3f %.3f %.3f\nEZ X/Y/H = %.3f %.3f %.3f\n"
-              "dX = %.3f\ndY = %.3f\nheading = %.3f\n"
-              "raw horizontal delta = %.0f\nraw vertical delta = %.0f\n"
-              "=================================\n",
-              after.x, after.y, after.theta, after_ez.x, after_ez.y, after_ez.theta,
-              after.x - before.x, after.y - before.y, after.theta,
-              horizontal_after - horizontal_before, vertical_after - vertical_before);
-  std::fflush(stdout);
-  motion_exit_trace_show();
-
-  final_turn_trace_arm(90.0);
-  nav_turn_to(90.0, 20);
-  final_turn_trace_nav_returned();
-  const auto corrected = nav_pose_get();
-  std::printf("\n===== AFTER FINAL HEADING CORRECTION =====\n"
-              "X = %.3f\nY = %.3f\nH = %.3f\n"
-              "heading error from 90 = %.3f deg\n"
-              "position change caused by final turn = %.3f in\n"
-              "turn exit reason = %s\n",
-              corrected.x, corrected.y, corrected.theta,
-              std::remainder(90.0 - corrected.theta, 360.0),
-              std::hypot(corrected.x - after.x, corrected.y - after.y),
-              ez::exit_to_string(turn_velocity_trace_result()).c_str());
-  std::fflush(stdout);
+  const std::vector<nav_waypoint> path{{0, 10}, {8, 20}, {20, 20}};
+  path_motion_trace_arm();
+  if constexpr (PATH_DIAGNOSTIC_MODE == 0) {
+    nav_follow_path(path, 127);
+  } else {
+    nav_follow_path_pose(path, 90.0, 127);
+  }
+  if (!path_motion_trace_stop_and_dump()) {
+    odom_display_freeze();
+    pros::lcd::set_text(0, "PATH TRACE: REST NOT VERIFIED");
+    pros::lcd::set_text(1, "Drive stopped; buffer retained");
+  }
 }
 void opcontrol() {
+  stop_all_mechanisms();
+  nav_cancel_sequence();
   odom_display_mutex.take();
   odom_display_frozen = false;
   odom_diagnostic_screen_release();
@@ -266,17 +275,40 @@ void opcontrol() {
   // Preserve encoders and odometry; do not depend on the AUTON_RAN flag.
   chassis.opcontrol_drive_activebrake_set(DRIVER_ACTIVE_BRAKE_KP);
 
+  driver_coast_mode = false;
   while (true) {
+    if (pros::competition::is_disabled() || pros::competition::is_autonomous()) {
+      stop_all_mechanisms();
+      restore_driver_brakes();
+      return;
+    }
+    if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_UP) && !driver_coast_mode) {
+      driver_coast_mode = true;
+      chassis.opcontrol_drive_activebrake_set(0.0);
+      chassis.drive_brake_set(MOTOR_BRAKE_COAST);
+    }
     const int left_y = master.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
     const int right_x = master.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
     driver_arcade_control(left_y, right_x);
 
-    // Temporary manual lift commissioning: L1 up, L2 down.
+    if (master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_L2)) {
+      if (!lift_return_home_start()) {
+        std::printf("Lift return unavailable: check switch/timeout/pneumatics/fault\n");
+        master.rumble("--");
+      }
+    }
     const bool lift_up = master.get_digital(pros::E_CONTROLLER_DIGITAL_L1);
-    const bool lift_down = master.get_digital(pros::E_CONTROLLER_DIGITAL_L2);
+    const bool lift_down = master.get_digital(pros::E_CONTROLLER_DIGITAL_DOWN);
     test_lift_manual(lift_up, lift_down);
+    // Open wins simultaneous R1/R2. Closing is blocked by the subsystem while
+    // returning; completion below stops the lift before forcing the claw closed.
+    if (master.get_digital(pros::E_CONTROLLER_DIGITAL_R2)) claw_open();
+    else if (master.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) claw_close();
+    color_toggle_set(master.get_digital(pros::E_CONTROLLER_DIGITAL_B));
     mechanisms_update();
 
     pros::delay(DRIVER_LOOP_MS);
   }
 }
+
+

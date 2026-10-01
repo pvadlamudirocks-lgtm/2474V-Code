@@ -56,3 +56,16 @@ $(BINDIR)/exit_conditions.cpp.o: $(FWDIR)/EZ-Template.a Makefile
 	$(AR) x --output=$(BINDIR) $< exit_conditions.cpp.o
 	$(OBJCOPY) --redefine-sym _ZN2ez5Drive8pid_waitEv=ez_trace_native_pid_wait $@
 $(HOT_ELF): $(BINDIR)/exit_conditions.cpp.o
+
+# EZ v3.2.2 PID.cpp, with only the integral sign-reset comparison corrected.
+# Replace the archive member so cold-image controllers also use the correction.
+# Source: https://github.com/EZ-Robotics/EZ-Template/blob/v3.2.2/src/EZ-Template/PID.cpp
+$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp Makefile
+	mkdir -p $(BINDIR)/ez_pid_patch
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/PID.cpp.o $<
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/PID.cpp.o
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/pid_tasks.cpp.o patches/EZ-Template/pid_tasks.cpp
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/pid_tasks.cpp.o
+
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/exit_conditions.cpp.o patches/EZ-Template/exit_conditions.cpp
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/exit_conditions.cpp.o

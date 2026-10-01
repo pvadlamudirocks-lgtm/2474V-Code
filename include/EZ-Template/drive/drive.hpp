@@ -3413,6 +3413,8 @@ class Drive {
  private:
   // Temporary read-only waypoint access for native exit-event snapshots.
   friend struct MotionExitTrace;
+  friend struct NavAccess;
+  friend struct PathMotionTrace;  // Read-only buffered controller diagnostics.
   void opcontrol_drive_activebrake_targets_set();
   double odom_smooth_weight_smooth = 0.0;
   double odom_smooth_weight_data = 0.0;
@@ -3671,3 +3673,4 @@ class Drive {
   bool is_reversed = false;
 };
 };  // namespace ez
+

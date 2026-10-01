@@ -1,5 +1,10 @@
 #pragma once
 #include "navigation.hpp"
+#include <utility>
+
+// Read-only capture of the existing wait's XY/angular results for a pose move.
+void pose_exit_trace_begin();
+std::pair<ez::exit_output, ez::exit_output> pose_exit_trace_finish();
 
 // Temporary observer: native PID/exit/wait routines remain unchanged.
 void motion_exit_trace_arm();

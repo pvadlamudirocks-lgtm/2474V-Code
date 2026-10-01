@@ -696,3 +696,30 @@ void odom_two_point_coordinate_test() {
   chassis.drive_set(0, 0);
   nav_print_pose();
 }
+
+#include "nav_sequence.hpp"
+void motion_chaining_test(bool chained) {
+  chassis.drive_set(0, 0);
+  nav_set_start(0, 0, 0); // Only reset in the entire route.
+  std::printf("\n===== MOTION CHAIN TEST %s =====\n"
+              "Start claw physically +Y. Centerline envelope X=0..12 Y=0..30 inches.\n"
+              "Allow robot footprint and stopping clearance beyond centerline. No mechanism actuation.\n",
+              chained ? "B / CHAINED" : "A / NON-CHAINED");
+  std::fflush(stdout);
+  NavSequence sequence(true);
+  if (!nav_validate_pose(0,0,0,0.5,0.5)) nav_abort("start pose mismatch");
+  const auto travel_end = chained ? NavEndMode::CHAIN : NavEndMode::SETTLE;
+  nav_events({{[](const NavProgress& p) { return p.distance >= 3; },
+               [] { nav_trace_marker(); return true; }}});
+  // One timeline. Every rejected/faulted movement prevents all later dispatches.
+  bool success = nav_drive_distance(8, 110, travel_end) &&
+      nav_turn_to(25, 40, travel_end) &&
+      nav_drive_distance(6, 110, travel_end) &&
+      nav_follow_path({{4,17},{7,22}}, 110, travel_end) &&
+      nav_follow_path({{10,27},{12,30}}, 110, NavEndMode::SETTLE) &&
+      nav_turn_to(30, 40, NavEndMode::SETTLE);
+  const bool finished = sequence.finish();
+  std::printf("Route result=%s finish=%s fault=%s\n", success ? "OK" : "FAILED",
+              finished ? "OK" : "FAILED", nav_fault());
+  nav_trace_dump();
+}

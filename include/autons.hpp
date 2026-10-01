@@ -53,3 +53,6 @@ void odom_start_screen_test();
 
 // Temporary no-motion state trace; latches the Brain display.
 void odom_trace_screen_show(const char* label);
+
+// One compact timeline, identical geometry/tuning in A=false and B=true.
+void motion_chaining_test(bool chained);

@@ -20,6 +20,15 @@ constexpr int CLAW_DISTANCE_PORT = 19;
 constexpr char CLAW_ADI_PORT = 'A';       // TODO CONFIRM wiring.
 constexpr char CLAW_FLIP_ADI_PORT = 'B';  // TODO CONFIRM wiring.
 constexpr char LIFT_HOME_SWITCH_ADI_PORT = 'C'; // Teammate-operated command switch.
+// TODO assign the REAL bottom switch port ('A'-'H'). 0 means unbound;
+// no DigitalIn is constructed and automatic return is rejected while unbound.
+constexpr int LIFT_BOTTOM_LIMIT_PORT = 0;
+constexpr bool LIFT_BOTTOM_LIMIT_PRESSED_VALUE = true; // Verify actual wiring.
+// TODO measure worst-case full descent at the existing 1500 mV, then choose
+// a finite timeout with margin. Zero disables return; no guessed travel time.
+constexpr unsigned LIFT_RETURN_TIMEOUT_MS = 0;
+// TODO bind the Override color mechanism; unrelated to the existing claw flip.
+// No device type/port is assumed. Implement color_toggle_set() when selected.
 constexpr bool CLAW_OPEN_OUTPUT = true; // TODO VERIFY pneumatic polarity.
 constexpr bool FLIP_REVERSE_OUTPUT = true; // false output should be normal.
 // TODO VERIFY PHYSICALLY: BOTH linked motors must drive the axle the same way.
@@ -28,10 +37,8 @@ constexpr bool RIGHT_LIFT_REVERSED = false;
 constexpr bool ARM_MOTOR_REVERSED = false;
 constexpr bool LIFT_ROTATION_REVERSED = false;
 constexpr bool ARM_ROTATION_REVERSED = false;
-// TODO VERIFY actual Rotation Sensor mounting: 1.0 assumes direct final-output
-// shaft coupling. External motor gearing alone does not change this sensor ratio.
-// If mounted before the gearing, measure sensor degrees per lift-output degree
-// and update this ratio before enabling feedback; mounting is not yet confirmed.
+// Confirmed: sensor is on the actual lift/output axle. Only centidegrees ->
+// degrees conversion applies; NEVER apply the 24T -> 12T motor speed-up here.
 constexpr double LIFT_SENSOR_DEG_PER_MECHANISM_DEG = 1.0;
 constexpr double ARM_SENSOR_DEG_PER_MECHANISM_DEG = 1.0; // TODO VERIFY coupling.
 
@@ -47,8 +54,6 @@ constexpr unsigned LIFT_HOME_PRESS_SEQUENCE_TIMEOUT_MS = 10000;
 constexpr bool LIFT_FEEDBACK_VERIFIED = false;
 constexpr bool ARM_FEEDBACK_VERIFIED = false;
 constexpr bool ENABLE_PNEUMATICS = false;
-// TODO VERIFY claw-close/lift-lower overlap and arm/lift collision clearance.
-constexpr bool POST_SCORE_RESET_VERIFIED = false;
 
 // TODO PHYSICAL CALIBRATION REQUIRED. Zero maxima disable automatic movement.
 constexpr bool LIFT_LIMITS_CALIBRATED = false;
@@ -97,7 +102,7 @@ constexpr unsigned CLAW_DISTANCE_SAMPLE_MS = 20;
 constexpr int DISTANCE_CONFIDENCE_AVAILABLE_ABOVE_MM = 200; // Installed PROS API.
 }
 
-enum class LiftMode { Disabled, Manual, Hold, MoveToTarget, Fault };
+enum class LiftMode { Disabled, Manual, Hold, MoveToTarget, Fault, ReturningHome };
 enum class ArmMode { Disabled, Manual, Hold, MoveToTarget, Fault };
 
 // Single-owner API: commands and updates must run from the SAME task.
@@ -108,7 +113,7 @@ void mechanisms_initialize();
 // Physically place/support at known home FIRST. Zeroing leaves motors disabled.
 bool lift_zero_at_current_position();
 bool arm_zero_at_current_position();
-// Refresh every loop while held; manual always cancels automatic movement.
+// Refresh every loop while held; manual cannot interrupt ReturningHome.
 // Call stop_and_hold ONCE on release, not on every idle loop.
 void lift_manual_up();
 void lift_manual_down();
@@ -126,6 +131,13 @@ bool lift_move_low();
 bool lift_move_mid();
 bool lift_move_high();
 bool lift_move_max();
+// Nonblocking switch-based return. Requires bound switch, measured timeout,
+// and enabled claw hardware. Keep lift_update()/mechanisms_update() serviced.
+bool lift_return_home_start();
+bool lift_return_home_active();
+enum class LiftBottomLimit { Unconfigured, Released, Pressed, Fault };
+LiftBottomLimit lift_bottom_limit_read(); // Never substitutes a fake reading.
+bool color_toggle_set(bool held); // false = hardware not yet bound.
 bool arm_set_target(double position_deg);
 bool arm_move_home();
 bool arm_move_score();
@@ -149,7 +161,7 @@ bool claw_flip_forward();
 bool claw_flip_reverse();
 bool claw_flip_toggle();
 bool claw_object_detected(); // Cached, debounced, freshness-checked result.
-// Close command, then lift home target. Arm stays put until clearance is known.
+// Switch-based descent, STOP, then close claw; arm stays put.
 bool mechanism_return_home();
 void stop_all_mechanisms(); // Zero voltage, cancel targets; does NOT hold or vent.
 void mechanisms_print_debug(); // Throttled terminal output; preserves odom screen.
