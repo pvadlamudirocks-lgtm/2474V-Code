@@ -253,7 +253,7 @@ void path_motion_trace_begin(const std::vector<ez::odom>& movements) {
   reference_heading = requested.theta;
   if (requested.theta == ez::ANGLE_NOT_SET) {
     reference_heading = segment_valid ? std::atan2(segment_x, segment_y) * 180 / M_PI : NAN;
-    if (movements.back().drive_direction == ez::fwd) reference_heading += 180;
+    if (movements.back().drive_direction == ez::rev) reference_heading += 180;
   }
   began = pros::millis();
   armed = false;
@@ -310,7 +310,7 @@ void print_events(const Sample& s) {
 void dump() {
   std::printf("\n===== PURE PURSUIT BUFFERED TRACE BEGIN =====\n"
               "ASCII; ms relative to path dispatch; inches/degrees/RPM; nan heading=XY-only.\n"
-              "Commands are native integer EZ motor requests; +EZ is old-front-leading.\n"
+              "Commands are native integer EZ motor requests; +EZ is FRONT-first.\n"
               "travel_cmd=(L+R)/2*dir_sign: positive=requested travel, negative=reverse.\n"
               "control_x/y=actual PTP/carrot target; final_plane_remaining<0=past plane.\n"
               "mode 5=POINT_TO_POINT,6=PURE_PURSUIT; dir 0=fwd,1=rev.\n"

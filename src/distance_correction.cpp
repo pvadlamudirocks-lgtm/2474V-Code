@@ -15,14 +15,14 @@ constexpr int DIST_BACK_CORRECTION_SIGN = 1;
 constexpr int DIST_FRONT_SQUARE_TURN_SIGN = 1;
 constexpr int DIST_BACK_SQUARE_TURN_SIGN = 1;
 
-// TODO: Deferred sensor redesign must use NEW FRONT = old back, NEW BACK =
-// old front, NEW LEFT = old right, NEW RIGHT = old left. Fixed field walls
+// TODO: Verify deferred sensor mounting against the canonical FRONT/BACK/LEFT/RIGHT
+// robot frame before enabling this module. Fixed field walls
 // remain +X, -X, +Y, -Y. Names/ports below are legacy placeholders, unchanged.
 // TODO: Placeholder ports. Change all distance sensor ports after wiring.
-// Front sensors are useful for intake-side alignment or front-facing references.
+// Front sensors are placeholders for front-facing references.
 pros::Distance frontLeftDistance(8);
 pros::Distance frontRightDistance(9);
-// Back sensors are priority for scoring alignment because scoring is from back.
+// Back sensors are placeholders for back-facing references.
 pros::Distance backLeftDistance(10);
 pros::Distance backRightDistance(11);
 // Left/right sensors are useful for wall/reference resets and X/Y drift checks.

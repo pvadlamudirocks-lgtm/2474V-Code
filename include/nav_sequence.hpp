@@ -29,6 +29,7 @@ struct NavEvent {
 // Arm events for the NEXT movement. Consumed once; no controller change here.
 bool nav_events(std::vector<NavEvent> events);
 bool nav_ok();
+bool nav_sequence_active(); // Ownership, including faulted sequences awaiting finish.
 const char* nav_fault();
 void nav_abort(const char* reason = "caller abort"); // reason must have static lifetime
 void nav_trace_marker(); // Buffered harmless mechanism-event marker.

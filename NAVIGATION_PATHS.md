@@ -10,7 +10,7 @@ buffered trace and source analysis. No red-to-yellow field route is supplied.
 Include `navigation.hpp`. Supply absolute field X/Y coordinates in inches, in
 travel order; the last entry is the destination. EZ adds the current odometry
 position as the start, so you do not need to repeat it. Public +Y and +X retain
-their existing meanings. Heading always describes the claw.
+their existing meanings. Heading always describes FRONT.
 
 Documentation-only example using variables you must define from physical testing:
 
@@ -26,12 +26,12 @@ nav_follow_path(my_waypoints, my_speed);
 Alternatively, for a final public heading, use **one** call:
 
 ```cpp
-nav_follow_path_pose(my_waypoints, my_final_claw_heading, my_speed);
+nav_follow_path_pose(my_waypoints, my_final_heading, my_speed);
 ```
 
-To travel old-front-first for the entire path, append
-`nav_path_direction::claw_reverse` as the final argument to either call.
-The default `claw_forward` maps to EZ `rev`; `claw_reverse` maps to EZ `fwd`.
+To travel BACK-first for the entire path, append
+`nav_path_direction::reverse` as the final argument to either call.
+The default `forward` maps to EZ `fwd`; `reverse` maps to EZ `rev`.
 The wrapper intentionally keeps one direction throughout the motion, avoiding
 direction-reversal stops. Speed must be 1 through 127.
 
@@ -81,7 +81,7 @@ continuous execution does not imply constant speed or exact heading convergence.
 
 For a future public heading of 180 degrees, supply that value yourself to
 `nav_follow_path_pose` when ready. The existing conversion requests EZ heading
-0 degrees. Choose the last shaping point and clearance so Boomerang has room to
+180 degrees. Choose the last shaping point and clearance so Boomerang has room to
 make its approach. Final position and heading depend on geometry, existing
 controller settings, exits, traction and odometry; no exact heading is guaranteed.
 

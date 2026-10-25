@@ -45,6 +45,8 @@
 
 // More includes here...
 
+// Shared drivetrain object, defined once in src/main.cpp.
+// Navigation helpers use this declaration to command the same hardware.
 extern ez::Drive chassis;
 
 

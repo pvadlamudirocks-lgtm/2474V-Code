@@ -1,7 +1,7 @@
 {
     "py/object": "pros.conductor.project.Project",
     "py/state": {
-        "project_name": "EZ-Template-Example",
+        "project_name": "2474V",
         "target": "v5",
         "templates": {
             "EZ-Template": {
@@ -424,7 +424,7 @@
             }
         },
         "upload_options": {
-            "description": "roboticsisez.com"
+            "description": "2474V"
         },
         "use_early_access": false
     }

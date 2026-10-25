@@ -6,14 +6,14 @@ L1 commands up, L2 commands down, and release commands zero voltage while feedba
 is disabled. There is no background mechanism task or automatic startup homing.
 No hardware behavior has been physically validated.
 
-## Confirmed lift gearing and first test (2026-09-20)
+## Confirmed lift gearing (corrected 2026-10-03) and first test
 
 Lift motors are on Smart Ports 14/15 and the Rotation Sensor is on 16. Both motors
-still use `pros::v5::MotorGears::green`: nominal 200 RPM cartridges. The external
-2:1 speed-up means two output revolutions per motor revolution, for approximately
-400 RPM nominal lift output. This is a mechanical specification, not a measured
-speed or a 400-RPM cartridge setting. `LIFT_MOTOR_RPM`, `LIFT_SPEED_UP_RATIO`, and
-`LIFT_OUTPUT_RPM` document it; the voltage controller needs no new RPM calculation.
+still use `pros::v5::MotorGears::green`: nominal 200 RPM cartridges. The builders
+confirmed external gearing is 1:1, so nominal lift output is also 200 RPM with no
+extra motor-to-output scaling. This is a hardware specification, not a measured
+speed. `LIFT_MOTOR_RPM` is 200, `LIFT_SPEED_UP_RATIO` is 1.0, and
+`LIFT_OUTPUT_RPM` equals `LIFT_MOTOR_RPM`; the voltage controller needs no new RPM calculation.
 
 Sensor mounting remains unconfirmed. `LIFT_SENSOR_DEG_PER_MECHANISM_DEG` stays 1.0,
 which assumes direct coupling to the final lift/output shaft. Before feedback is
@@ -24,7 +24,7 @@ ratio; do not apply motor gearing to a sensor already on the final output shaft.
 Only lift manual commissioning is enabled. Lift feedback, limits, scoring presets,
 and `ENABLE_LIFT_HOME_SWITCH_COMMAND` remain false. The six-press logic is unchanged
 and disabled. Both lift reversal flags remain false pending physical testing.
-`LIFT_MANUAL_MV` remains 1500; this is not a 400 RPM speed test.
+`LIFT_MANUAL_MV` remains 1500; this is a voltage-based direction test, not a speed test.
 
 After uploading:
 
@@ -413,3 +413,81 @@ files changed separately during the task and those changes were left intact.
 Navigation and distance-correction file hashes still matched the initial audit.
 No drivetrain/tracker/IMU configuration or drivetrain PID constants were edited
 by this task. No hardware behavior is claimed as physically validated.
+
+## 2026-10-01: claw, flex wheels, active toggle integration
+
+This section supersedes historical claw-area wiring assumptions above. Current
+configuration is in include/subsystems.hpp. No new ports are assigned. ADI C
+remains the historical six-press input. Legacy flip/distance code is unchanged,
+disabled, and is not part of this open-loop mechanism layer. Keep the legacy
+ENABLE_PNEUMATICS flag false; the single claw uses CLAW_PNEUMATIC_CONFIGURED.
+
+Set real ports and their configured flags only after wiring confirmation. Port 0
+never constructs a device. Availability validates ranges, opposite flex reversals,
+and known port conflicts; it does not prove a device is physically connected.
+Smart ports reserved by existing devices/placeholders are rejected. If those old
+placeholders are retired later, update the reservation check deliberately.
+CLAW_OPEN_OUTPUT selects open polarity; closed is its complement. The first
+piston construction uses the requested output, avoiding an intermediate closure.
+No new pneumatic command is issued on disabled or safe reset.
+
+Driver: R1 holds claw_grab (close + intake); R2 holds claw_score (open + outtake).
+Release stops flex and retains piston state. Both held stops flex and retains the
+piston state. B holds toggle_run; release calls toggle_stop. Existing L1/Down/L2
+and Up behavior is retained. The lift-return close interlock remains in force;
+its readiness guard now checks the real claw availability instead of the legacy
+pneumatics flag. A rejected piston command stops flex and rejects the composite.
+Composite commands report success only when both actions succeed; they are not
+transactional (a successful piston write is not rolled back on a motor failure).
+
+All semantic APIs are nonblocking and callable from driver or autonomous code.
+Use pickup_prepare, route movement, pickup_capture, continued movement, then
+pickup_finish. Prepare opens and intakes; capture closes and intakes; finish only
+stops flex. No duration, navigation, or controller dependency is inside them.
+claw_score is the single R2/scoring policy. toggle_run requests 200 motor RPM
+with a green cartridge and configurable reversal; the route calls toggle_stop.
+Each flex motor has its own reversal flag; flags must be opposite. Both receive
+the same command, with one shared FLEX_INTAKE_SIGN. Outtake reverses that command.
+Powers accept magnitudes 0..127; defaults are ZERO until commissioned, not tuned.
+Stops use zero voltage, without adding HOLD mode. Initialization, disabled, and
+entry to either competition mode stop the new motors via existing reset hooks.
+Commands reject starting while disabled. Existing single-task ownership applies.
+
+Tests in autons.cpp are separate, explicit, nonblocking steps, not timed routines:
+- claw_flex_test(ClawFlexTestStep::Open/Close/Intake/Outtake/Stop, power)
+- toggle_test(true) to run, toggle_test(false) to stop (default is stop)
+- pickup_sequence_test(PickupTestStep::Prepare/Capture/Finish)
+Call steps once at operator-selected events. Do not call diagnostic steps every
+loop (they print on each invocation). No tests are selected automatically. Every
+started test must end with Stop/Finish, or disabled; no guessed timeout is added.
+Unavailable tests report configuration failure and return without fake hardware.
+Autonomous callers should check bool results and stop/abort on rejected commands.
+
+Remaining physical-test TODOs:
+1. Assign actual left flex Smart Port.
+2. Assign actual right flex Smart Port.
+3. Verify each flex motor reversal and opposite shaft rotation.
+4. Verify/flip FLEX_INTAKE_SIGN for inward transport.
+5. Establish FLEX_INTAKE_POWER (currently zero).
+6. Establish FLEX_OUTTAKE_POWER (currently zero).
+7. Decide whether/how long flex continues after capture; route controls timing.
+8. Assign claw pneumatic ADI port (never C or the lift bottom switch).
+9. Verify true/false output that physically opens the claw.
+10. Verify complementary output physically closes it.
+11. Assign active-toggle Smart Port.
+12. Verify/flip TOGGLE_REVERSED.
+13. Confirm motor clockwise (record viewing side) gives final output counterclockwise.
+14. Determine toggle stop coast/brake preference; currently zero-voltage stop.
+15. Determine whether claw_score/R2 needs flex outtake or only piston open.
+16. Measure actual autonomous pickup/scoring timing, including any piston settling.
+
+First physical test after wiring is supplied: secure the robot with drivetrain
+clear and claw area empty; leave flex defaults at zero and B released. Bind the
+claw alone and issue Open, then Close as separate operator commands, checking
+polarity before adding motors. Next bind flex, select a low positive test power
+at the test session, issue Intake then Stop under operator control, verify opposite
+shafts and inward transport, then Outtake/Stop. Test toggle separately, with an
+operator-controlled B hold/release at its required 200 RPM, checking viewing side
+and final output direction. Verify disabled stops both motor mechanisms and leaves
+the piston state unchanged before trying combined pickup or any autonomous motion.
+No physical direction, power, duration, or brake preference is claimed validated.

@@ -1,5 +1,6 @@
 #include "nav_sequence.hpp"
 #include "subsystems.hpp"
+#include "nav_diagnostics.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
 #include <algorithm>
 #include <atomic>
@@ -7,6 +8,8 @@
 #include <cstdio>
 
 namespace {
+// ----- Sequence ownership and saved motion state -----
+// One autonomous task owns a sequence; a pending CHAIN still has motion to finish.
 bool active = false, waiting = false, pending = false, busy = false, tracing = false;
 bool print_before = false, encoder_motion = false, turn_motion = false;
 const char* fault = nullptr;
@@ -17,10 +20,19 @@ std::vector<NavEvent> queued, events;
 std::vector<bool> fired;
 std::atomic<int> command_left{0}, command_right{0};
 std::atomic<unsigned> command_ms{0};
+std::atomic<int> peak_left_command{0}, peak_right_command{0};
+std::atomic<unsigned> command_samples{0};
+int motion_requested_speed = 0;
+bool motion_slew_requested = false;
 enum Flags : unsigned { START=1, RELEASE=2, SETTLED=4, ZERO=8, REVERSAL=16,
   HEADING=32, FAILURE=64, ACTION=128, FINISH=256 };
 struct Row { unsigned ms, motion, flags, command_time; ez::pose pose;
-  double error, heading_error, left_rpm, right_rpm; int left, right; };
+  double error, heading_error, left_rpm, right_rpm; int left, right;
+  int requested_speed = 0, peak_left = 0, peak_right = 0;
+  unsigned commands = 0;
+  bool slew_requested = false, slew_active = false;
+  double slew_limit = 0, xy_output = 0, angular_output = 0, control_heading_error = 0; };
+void capture_controller(Row& row);
 constexpr unsigned CAPACITY = 3000;
 Row rows[CAPACITY];
 unsigned row_count = 0, dropped = 0, zero_events = 0;
@@ -37,9 +49,13 @@ bool rest(const std::vector<pros::Motor>& motors) {
 }
 double rpm(const std::vector<pros::Motor>& motors) {
   if (motors.empty()) return NAN;
-  double sum = 0;
-  for (const auto& m : motors) sum += m.get_actual_velocity();
-  return sum / motors.size();
+  double peak = 0;
+  for (const auto& m : motors) {
+    const double value = m.get_actual_velocity();
+    if (!std::isfinite(value)) return NAN;
+    peak = std::max(peak, std::fabs(value));
+  }
+  return peak;
 }
 double heading_error() {
   return target.theta == ez::ANGLE_NOT_SET ? NAN :
@@ -52,6 +68,7 @@ double position_error() {
   const auto p = nav_pose_get();
   return std::hypot(target.x - p.x, target.y - p.y);
 }
+// Save diagnostic rows in memory so serial printing does not delay a handoff.
 void sample(unsigned flags = 0) {
   if (!tracing) return;
   const int l = command_left.load(), r = command_right.load();
@@ -68,11 +85,22 @@ void sample(unsigned flags = 0) {
   if (fault || chassis.interfered) flags |= FAILURE;
   Row row{pros::millis() - sequence_start, movement, flags, command_ms.load(),
           nav_pose_get(), position_error(), h, rpm(chassis.left_motors), rpm(chassis.right_motors), l, r};
+  capture_controller(row);
+  row.requested_speed = motion_requested_speed;
+  row.slew_requested = motion_slew_requested;
+  row.peak_left = peak_left_command.load(); row.peak_right = peak_right_command.load();
+  row.commands = command_samples.load();
   if (row_count < CAPACITY) rows[row_count++] = row; else ++dropped;
 }
 void observe_command(ez::Drive* drive, int l, int r) {
   if (drive != &chassis) return;
   command_left.store(l); command_right.store(r); command_ms.store(pros::millis());
+  // Observe each native command, including peaks between wait-service samples.
+  int old = peak_left_command.load();
+  while (std::abs(l) > old && !peak_left_command.compare_exchange_weak(old, std::abs(l))) {}
+  old = peak_right_command.load();
+  while (std::abs(r) > old && !peak_right_command.compare_exchange_weak(old, std::abs(r))) {}
+  command_samples.fetch_add(1);
 }
 }
 namespace ez {
@@ -84,7 +112,16 @@ struct NavAccess {
       if (chassis.pp_index >= chassis.injected_pp_index[i]) result = i - 1;
     return result;
   }
+  static void capture_controller(Row& row) {
+    row.slew_active = chassis.slew_left.enabled() || chassis.slew_right.enabled();
+    row.slew_limit = std::max(chassis.slew_left.output(), chassis.slew_right.output());
+    row.xy_output = chassis.xyPID.output;
+    row.angular_output = chassis.current_a_odomPID.output;
+    row.control_heading_error = chassis.current_a_odomPID.error;
+  }
   static void save_targets() {
+    motion_requested_speed = chassis.pid_speed_max_get();
+    motion_slew_requested = chassis.current_slew_on;
     left_target = chassis.leftPID.target_get(); right_target = chassis.rightPID.target_get();
     turn_target = chassis.turnPID.target_get();
     // Avoid allocation during native quick-chain's appended extension.
@@ -104,7 +141,12 @@ struct NavAccess {
 };
 }
 
+namespace {
+void capture_controller(Row& row) { ez::NavAccess::capture_controller(row); }
+}
+
 bool nav_ok() { return active && !fault && !chassis.interfered; }
+bool nav_sequence_active() { return active; }
 const char* nav_fault() { return fault ? fault : chassis.interfered ? "EZ interference" : "none"; }
 void nav_abort(const char* reason) {
   if (!fault) fault = reason;
@@ -123,7 +165,13 @@ void nav_observe_exit(ez::exit_output result) {
 }
 namespace {
 bool service(ez::Drive* drive) {
+  // EZ calls this in the waiting task, not a new mechanism task.
+  // Check safety, update mechanisms and fire each requested event at most once.
   if (drive != &chassis || !active || !waiting) return true;
+  if (pros::competition::is_disabled() || !pros::competition::is_autonomous()) {
+    nav_abort("competition mode changed"); return false;
+  }
+  if (!nav_sensors_ready()) { nav_abort("navigation sensor fault"); return false; }
   if (!nav_ok()) { nav_abort("EZ interference"); return false; }
   if (pros::millis() - started >= timeout_ms) { nav_abort("motion timeout"); return false; }
   const auto p = nav_pose_get();
@@ -132,7 +180,13 @@ bool service(ez::Drive* drive) {
   }
   traveled += std::hypot(p.x - previous_pose.x, p.y - previous_pose.y);
   previous_pose = p;
+  const auto lift_before = lift_mode();
+  const auto arm_before = arm_mode();
   mechanisms_update();
+  if ((lift_before != LiftMode::Disabled && lift_before != LiftMode::Fault && lift_mode() == LiftMode::Fault) ||
+      (arm_before != ArmMode::Disabled && arm_before != ArmMode::Fault && arm_mode() == ArmMode::Fault)) {
+    nav_abort("mechanism fault during navigation"); return false;
+  }
   NavProgress progress{p, traveled, ez::NavAccess::waypoint(), pros::millis() - started};
   for (unsigned i = 0; i < events.size(); ++i) {
     if (!fired[i] && events[i].when(progress)) {
@@ -148,6 +202,7 @@ bool verify_rest() {
   unsigned stable = 0;
   const auto began = pros::millis();
   while (pros::millis() - began < 2000) {
+    if (pros::competition::is_disabled() || !pros::competition::is_autonomous()) return false;
     mechanisms_update();
     sample();
     const bool stopped = rest(chassis.left_motors) && rest(chassis.right_motors);
@@ -163,6 +218,8 @@ bool accurate() {
       (target.theta == ez::ANGLE_NOT_SET || (std::isfinite(h) && std::fabs(h) <= 3.0));
 }
 }
+// ----- Sequence lifetime -----
+// Starting takes control of the wait hooks; finishing releases them and stops outputs.
 NavSequence::NavSequence(bool trace, unsigned deadline) {
   if (active) { nav_abort("nested sequence"); return; }
   owner_ = true; active = true; fault = nullptr;
@@ -181,6 +238,7 @@ NavSequence::NavSequence(bool trace, unsigned deadline) {
 NavSequence::~NavSequence() { if (owner_) finish(); }
 bool NavSequence::ok() const { return owner_ && nav_ok(); }
 bool NavSequence::finish() {
+  // A route may end after CHAIN. Restore its real endpoint before the final wait.
   if (!owner_) return false;
   if (pending && nav_ok()) {
     ez::navigation_lock(); ez::NavAccess::restore_target(); ez::navigation_unlock();
@@ -211,6 +269,8 @@ bool nav_events(std::vector<NavEvent> next) {
   queued = std::move(next); return true;
 }
 void nav_trace_marker() { sample(ACTION); }
+// ----- Movement handoff -----
+// CHAIN releases early for the next command; SETTLE also checks error and rest.
 bool nav_detail::move(const std::function<void()>& dispatch, NavEndMode end,
                       ez::pose requested, double, bool encoder, bool turn) {
   if (!nav_ok()) return false;
@@ -219,32 +279,77 @@ bool nav_detail::move(const std::function<void()>& dispatch, NavEndMode end,
   target = requested; previous_pose = nav_pose_get(); traveled = 0;
   events = std::move(queued); queued.clear(); fired.assign(events.size(), false);
   started = pros::millis(); ++movement;
-  ez::navigation_lock(); dispatch(); ez::NavAccess::save_targets(); ez::navigation_unlock(); sample(START);
+  ez::navigation_lock();
+  peak_left_command.store(0); peak_right_command.store(0); command_samples.store(0);
+  command_left.store(0); command_right.store(0); command_ms.store(0);
+  dispatch(); ez::NavAccess::save_targets();
+  ez::navigation_unlock(); sample(START); // START proves dispatch() actually ran.
   waiting = true;
   if (end == NavEndMode::CHAIN) chassis.pid_wait_quick_chain(); else chassis.pid_wait();
   waiting = false;
-  if (nav_ok() && !accurate()) nav_abort("release/settle outside 1in or 3deg acceptance");
+  // Native CHAIN release is an intermediate handoff, not final pose acceptance.
+  if (nav_ok() && end == NavEndMode::SETTLE && !accurate()) nav_abort("settle outside 1in or 3deg acceptance");
   for (unsigned i = 0; i < events.size(); ++i)
     if (events[i].required && !fired[i]) nav_abort("required movement event not reached");
   if (nav_ok() && end == NavEndMode::SETTLE && !verify_rest()) nav_abort("settle rest timeout");
   if (nav_ok() && end == NavEndMode::SETTLE && !accurate()) nav_abort("pose drift during settle");
   if (!nav_ok()) nav_abort("EZ interference");
   pending = nav_ok() && end == NavEndMode::CHAIN;
-  sample(pending ? RELEASE : SETTLED);
+  sample(!nav_ok() ? FAILURE : pending ? RELEASE : SETTLED);
   busy = false;
   return nav_ok();
 }
+// ----- Post-run report -----
+// Print the saved timeline only after the sequence has finished and rest was verified.
 void nav_trace_dump() {
-  if (active || !tracing || !rest_verified) return;
+  if (active || !tracing) return;
+  if (!rest_verified) {
+    std::printf("CHAIN TRACE WITHHELD: rest not verified after stop; fault=%s\n", nav_fault());
+    std::fflush(stdout);
+    return;
+  }
+  std::printf("\n===== BUFFERED MOVEMENT SUMMARY =====\n");
+  for (unsigned id = 1; id <= movement; ++id) {
+    int peak_l = 0, peak_r = 0, requested = 0;
+    double rpm_l = NAN, rpm_r = NAN, slew_min = INFINITY, slew_max = -INFINITY;
+    bool slew_requested = false, slew_active = false, failure_reported = false;
+    unsigned commands = 0;
+    for (unsigned i = 0; i < row_count; ++i) {
+      const auto& s = rows[i];
+      if (s.motion != id) continue;
+      requested = s.requested_speed;
+      peak_l = std::max(peak_l, s.peak_left); peak_r = std::max(peak_r, s.peak_right);
+      commands = std::max(commands, s.commands);
+      if (std::isfinite(s.left_rpm)) rpm_l = std::isfinite(rpm_l) ? std::max(rpm_l,s.left_rpm) : s.left_rpm;
+      if (std::isfinite(s.right_rpm)) rpm_r = std::isfinite(rpm_r) ? std::max(rpm_r,s.right_rpm) : s.right_rpm;
+      slew_requested |= s.slew_requested; slew_active |= s.slew_active;
+      slew_min = std::min(slew_min,s.slew_limit); slew_max = std::max(slew_max,s.slew_limit);
+      if ((s.flags & FAILURE) && !failure_reported) {
+        std::printf("MOVE %u FAILED at %u ms | error: %.3f in | fault=%s\n",id,s.ms,s.error,nav_fault());
+        failure_reported = true;
+      }
+      if (s.flags & START) std::printf("MOVE %u START (dispatched) at %u ms\n",id,s.ms);
+      if (s.flags & RELEASE) std::printf("MOVE %u CHAIN RELEASE at %u ms | ERROR AT RELEASE: %.3f in\n",id,s.ms,s.error);
+      if ((s.flags & SETTLED) && !(s.flags & FAILURE)) std::printf("MOVE %u SETTLED at %u ms | error: %.3f in\n",id,s.ms,s.error);
+    }
+    std::printf("MOVE %u requested_speed=%d | max_abs_command L=%d R=%d | command_samples=%u\n"
+                "max_sampled_abs_motor_RPM L=%.2f R=%.2f | slew_requested=%d slew_active_seen=%d | sampled_slew_limit=%.2f..%.2f\n"
+                "command_near_127 (>=125): L=%s R=%s\n",
+                id,requested,peak_l,peak_r,commands,rpm_l,rpm_r,slew_requested,slew_active,slew_min,slew_max,
+                commands ? (peak_l >= 125 ? "YES" : "NO") : "NO DATA",
+                commands ? (peak_r >= 125 ? "YES" : "NO") : "NO DATA");
+  }
+  std::printf("RPM is peak absolute individual-motor telemetry sampled during waits, not wheel/output-shaft RPM.\n"
+              "Controller columns below are sampled reads; command peaks observe every native write.\n");
   std::printf("\n===== MOTION CHAIN TRACE BEGIN =====\n"
               "flags: START/NEXT_MOTION_START=1 CHAIN_RELEASE=2 SETTLED=4 ZERO_SPEED_EVENT=8 "
               "COMMAND_SIGN_REVERSAL=16 LARGE_HEADING_CORRECTION=32 INTERFERENCE/FAULT=64 EVENT=128 FINISH=256\n"
-              "ms,motion,flags,command_timestamp,pub_x,pub_y,pub_h,position_error,heading_error,L_cmd,R_cmd,L_rpm,R_rpm\n");
+              "ms,motion,flags,command_timestamp,pub_x,pub_y,pub_h,position_error,heading_error,L_cmd,R_cmd,L_max_abs_motor_rpm,R_max_abs_motor_rpm,slew_limit,slew_active,xy_raw,angular_raw,control_heading_error\n");
   for (unsigned i = 0; i < row_count; ++i) {
     const auto& s = rows[i];
-    std::printf("%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.2f\n",
+    std::printf("%u,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.2f,%.2f,%.2f,%d,%.3f,%.3f,%.3f\n",
       s.ms,s.motion,s.flags,s.command_time,s.pose.x,s.pose.y,s.pose.theta,s.error,s.heading_error,
-      s.left,s.right,s.left_rpm,s.right_rpm);
+      s.left,s.right,s.left_rpm,s.right_rpm,s.slew_limit,s.slew_active,s.xy_output,s.angular_output,s.control_heading_error);
     if (i % 10 == 0) { std::fflush(stdout); pros::delay(10); }
   }
   const auto p = nav_pose_get();
