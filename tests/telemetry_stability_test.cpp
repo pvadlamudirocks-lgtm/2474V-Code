@@ -62,22 +62,22 @@ constexpr bool row_equals(telemetry_format::Row row, const char* expected) {
   for (; i<15; ++i) if (row[i] != ' ') return false;
   return row[15] == '\0';
 }
-constexpr auto typical = telemetry_format::dashboard(301.1,-16.6,14.3,842.4,18.42,true);
+constexpr auto typical = telemetry_format::dashboard(301.1,-16.6,14.3,842.4);
 static_assert(row_equals(typical[0], "X-16.6\" Y14.3\""));
 static_assert(row_equals(typical[1], "H 301d L 842d"));
-static_assert(row_equals(typical[2], "Ht 18.42in"));
+static_assert(row_equals(typical[2], "Lift 842.4 deg"));
 constexpr auto bad = telemetry_format::dashboard(stability::invalid,stability::invalid,
-    stability::invalid,stability::invalid,stability::invalid,false);
+    stability::invalid,stability::invalid);
 static_assert(row_equals(bad[0], "X--\" Y--\"") && row_equals(bad[1], "H --d L --d"));
-static_assert(row_equals(bad[2], "Ht --"));
-static_assert(row_equals(telemetry_format::dashboard(359.9,0,0,0,18.42,false)[1], "H 0d L 0d"));
-static_assert(row_equals(telemetry_format::dashboard(0,0,0,0,18.42,false)[2], "Ht 18.42in"));
-static_assert(row_equals(telemetry_format::dashboard(0,0,-999.9,-99999,0,true)[0], "X0.0\" Y-999.9\""));
-static_assert(row_equals(telemetry_format::dashboard(0,0,1e30,1e30,0,true)[1], "H 0d L --d"));
-static_assert(row_equals(telemetry_format::dashboard(0,-99.9,-99.9,0,0,true)[0], "X-99.9\" Y-99.9\""));
-static_assert(row_equals(telemetry_format::dashboard(0,-999.9,-999.9,0,0,true)[0], "X--\" Y-999.9\""));
-static_assert(row_equals(telemetry_format::dashboard(301,0,0,99999,0,true)[1], "H 301d L 99999d"));
-static_assert(row_equals(telemetry_format::dashboard(301,0,0,999999,0,true)[1], "H 301d L --d"));
+static_assert(row_equals(bad[2], "Lift -- deg"));
+static_assert(row_equals(telemetry_format::dashboard(359.9,0,0,0)[1], "H 0d L 0d"));
+static_assert(row_equals(telemetry_format::dashboard(0,0,0,0)[2], "Lift 0.0 deg"));
+static_assert(row_equals(telemetry_format::dashboard(0,0,-999.9,-99999)[0], "X0.0\" Y-999.9\""));
+static_assert(row_equals(telemetry_format::dashboard(0,0,1e30,1e30)[1], "H 0d L --d"));
+static_assert(row_equals(telemetry_format::dashboard(0,-99.9,-99.9,0)[0], "X-99.9\" Y-99.9\""));
+static_assert(row_equals(telemetry_format::dashboard(0,-999.9,-999.9,0)[0], "X--\" Y-999.9\""));
+static_assert(row_equals(telemetry_format::dashboard(301,0,0,99999)[1], "H 301d L 99999d"));
+static_assert(row_equals(telemetry_format::dashboard(301,0,0,999999)[1], "H 301d L --d"));
 constexpr unsigned visible_length(telemetry_format::Row row) {
   unsigned end = 15;
   while (end && row[end-1] == ' ') --end;
@@ -85,5 +85,7 @@ constexpr unsigned visible_length(telemetry_format::Row row) {
 }
 static_assert(visible_length(typical[0]) == 14);
 static_assert(visible_length(typical[1]) == 13);
-static_assert(visible_length(typical[2]) == 10);
+static_assert(visible_length(typical[2]) == 14);
+static_assert(row_equals(telemetry_format::dashboard(0,0,0,-135.2)[2], "Lift -135.2 deg"));
+static_assert(row_equals(telemetry_format::dashboard(0,0,0,999999)[2], "Lift -- deg"));
 int main() {} // All assertions execute at compile time on a host OR embedded compiler.

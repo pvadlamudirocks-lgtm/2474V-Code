@@ -12,6 +12,7 @@
 #include "navigation.hpp"
 #include "nav_diagnostics.hpp"
 #include "nav_sequence.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 #include "motion_exit_trace.hpp"
 #include "path_motion_trace.hpp"
 #include "subsystems.hpp"
@@ -116,6 +117,7 @@ void show_live_odometry() {
 }
 
 void display_odom_pose() {
+  pros::lcd::print(4, "LIFT POSITION: %.1f deg", lift_position_deg());
   if (!imu_calibrated) {
     pros::lcd::set_text(0, "IMU CALIBRATION FAILED");
     return;
@@ -126,7 +128,6 @@ void display_odom_pose() {
   pros::lcd::print(1, "X:     %7.2f in", pose.x);
   pros::lcd::print(2, "Y:     %7.2f in", pose.y);
   pros::lcd::print(3, "HEADING: %7.2f deg", pose.theta);  // FRONT heading.
-  pros::lcd::print(4, "Lift: %7.2f deg", lift_position_deg());
   pros::lcd::print(5, "Mode: %s", development_mode.load());
 }
 
@@ -174,6 +175,7 @@ ez::tracking_wheel vertical_tracker(VERTICAL_TRACKER_PORT,
 pros::Controller master(pros::E_CONTROLLER_MASTER);
 
 void initialize() {
+  ez::movement_health_set(nav_sensors_ready);
   // ----- Startup -----
   // Initialize mechanisms, attach trackers, calibrate the IMU, then show the selector.
   chassis.pid_drive_toggle(true);  // Restore normal powered calibration output.
@@ -193,7 +195,11 @@ void initialize() {
   // void return discards drive_imu_calibrate()'s synchronous success result.
   chassis.opcontrol_curve_sd_initialize();
   imu_calibrated = chassis.drive_imu_calibrate(true);
-  chassis.drive_sensor_reset();
+  nav_print_snapshot("INITIALIZE BEFORE drive_sensor_reset");
+  nav_manual_odom_sample(true);
+  if (nav_print_sensor_health()) chassis.drive_sensor_reset();
+  else std::printf("INITIALIZE sensor reset SKIPPED: fault preserved\n");
+  nav_print_snapshot("INITIALIZE AFTER drive_sensor_reset");
   master.rumble(imu_calibrated ? "." : "---");
 
   register_autons();
@@ -207,6 +213,8 @@ void initialize() {
 }
 
 void disabled() {
+  ez::movement_cancel("disabled");
+  ez::movement_stop();
   auton::lifecycle_stop("disabled");
   restore_driver_brakes();
   show_auton_selector();
@@ -219,9 +227,9 @@ void competition_initialize() {
 // ----- Autonomous mode selection -----
 // Change these switches to choose one test mode; all false uses the Brain selector.
 // Development bypasses selector dispatch; the installed Brain selector is for finalized routes.
-constexpr bool RUN_DEV_TEST = false;
-constexpr DevTest ACTIVE_DEV_TEST = DevTest::MANUAL_ODOM;
-constexpr bool RUN_CUSTOM_AUTON_TEST = true;
+constexpr bool RUN_DEV_TEST = true;
+constexpr DevTest ACTIVE_DEV_TEST = DevTest::FULL_SYSTEM_DIAG;
+constexpr bool RUN_CUSTOM_AUTON_TEST = false;
 // Set false ONLY for custom code containing no drivetrain/navigation commands.
 constexpr bool CUSTOM_AUTON_USES_NAVIGATION = true;
 constexpr bool RUN_ROUTE_SEGMENT_TEST = false;
@@ -230,34 +238,20 @@ static_assert(static_cast<int>(RUN_DEV_TEST)+static_cast<int>(RUN_CUSTOM_AUTON_T
               static_cast<int>(RUN_ROUTE_SEGMENT_TEST)<=1,"Select only one development mode");
 static_assert(!(RUN_DEV_TEST && RUN_CUSTOM_AUTON_TEST), "Select only one development mode");
 
-void custom_auton_test() {
+void custom_auton_test() {  
   // Intentional temporary P6/P19 toggle test; keep route experiments in this function.
   // Existing temporary test, now isolated from selector dispatch.
 nav_set_start(0, 0, 0);
 toggle_run();
 pros::delay(395);
-toggle_stop();
-// claw_close();
-//  flex_intake(127);//flex_intake(13);
-// nav_go_to(-17,15,127);//change to whatever you get from driving to position
-// nav_turn_to(301.41, 127);
-//make sure to also do reverse coordinates here.
-// flex_stop();
-// pros::delay(200);
-// claw_open();
-// pros::delay(300);
-//toggle-auton
-// toggle_run();
-// pros::delay(500);
-// toggle_stop();
-
-//skills auton
-// nav_go_to(0,55,127);
-
+toggle_stop();   //initial position - 
+// claw_close(); //base height - 
+// nav_drive_distance(12,127);
 }
 
 
 void autonomous() {
+  if (!ez::movement_begin_autonomous()) return;
   // ----- Autonomous dispatch -----
   // Each development branch returns here so it cannot also run a competition route.
   development_mode = RUN_ROUTE_SEGMENT_TEST ? "ROUTE SEGMENT" : RUN_DEV_TEST ? "DEV TEST" : RUN_CUSTOM_AUTON_TEST ? "CUSTOM TEST" : "COMPETITION";
@@ -277,7 +271,9 @@ void autonomous() {
   }
 
   if (RUN_DEV_TEST) {
-    if (!imu_calibrated && ACTIVE_DEV_TEST != DevTest::STABILITY_MONITOR) return;
+    if (!imu_calibrated && ACTIVE_DEV_TEST != DevTest::STABILITY_MONITOR &&
+        ACTIVE_DEV_TEST != DevTest::SENSOR_HEALTH && ACTIVE_DEV_TEST != DevTest::MANUAL_ODOM &&
+        ACTIVE_DEV_TEST != DevTest::FULL_SYSTEM_DIAG) return;
     run_dev_test(ACTIVE_DEV_TEST);
     return;
   }
@@ -290,11 +286,12 @@ void autonomous() {
 
   if (!imu_calibrated || !nav_print_sensor_health()) return;
   ez::as::auton_selector.selected_auton_call();
-}
+} 
 
 void opcontrol() {
   // ----- Driver control -----
   // This loop owns driver motor commands and services the mechanism state machines.
+  if (!ez::movement_stop()) { stop_all_mechanisms(); return; }
   auton::lifecycle_stop("opcontrol");
   development_mode = pose_recorder::enabled ? "POSE RECORDER" : "DRIVER";
   show_live_odometry();
@@ -318,10 +315,11 @@ void opcontrol() {
     }
     const int left_y = master.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
     const int right_x = master.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
-    driver_arcade_control(left_y, right_x);
+    driver_arcade_control(left_y, -right_x);
 
     // Temporary full-voltage commissioning: held L1 up, held L2 down.
     // Release or both held stops both motors; no presets or automatic return.
+    // L1 requests up; L2 requests down. Motor configuration is unchanged.
     test_lift_motor_response(master.get_digital(pros::E_CONTROLLER_DIGITAL_L1),
                              master.get_digital(pros::E_CONTROLLER_DIGITAL_L2));
     claw_driver_control(master.get_digital(pros::E_CONTROLLER_DIGITAL_R1),

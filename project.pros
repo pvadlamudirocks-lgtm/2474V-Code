@@ -5,7 +5,7 @@
         "target": "v5",
         "templates": {
             "EZ-Template": {
-                "location": "C:\\Users\\union\\AppData\\Roaming\\PROS\\templates\\EZ-Template@3.2.2",
+                "location": ".",
                 "metadata": {
                     "origin": "local"
                 },
@@ -30,7 +30,7 @@
                 "version": "3.2.2"
             },
             "kernel": {
-                "location": "C:\\Users\\union\\AppData\\Roaming\\PROS\\templates\\kernel@4.1.1",
+                "location": ".",
                 "metadata": {
                     "cold_addr": "58720256",
                     "cold_output": "bin/cold.package.bin",
@@ -105,7 +105,7 @@
                 "version": "4.1.1"
             },
             "liblvgl": {
-                "location": "C:\\Users\\union\\AppData\\Roaming\\PROS\\templates\\liblvgl@8.3.8",
+                "location": ".",
                 "metadata": {
                     "origin": "kernel-early-access-mainline"
                 },
@@ -281,7 +281,7 @@
                 "version": "8.3.8"
             },
             "okapilib": {
-                "location": "C:\\Users\\union\\AppData\\Roaming\\PROS\\templates\\okapilib@5.0.0",
+                "location": ".",
                 "metadata": {
                     "origin": "kernel-early-access-mainline"
                 },

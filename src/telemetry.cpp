@@ -24,11 +24,8 @@ void telemetry_update(pros::Controller& controller) {
     captured = true; captured_at = now;
     const auto pose = nav_pose_get();
     const bool pose_valid = nav_sensors_ready();
-    const auto height = lift_height_calibration_sample();
-    const bool vertical = std::isfinite(height.sensor_height_in);
     rows = telemetry_format::dashboard(pose_valid ? pose.theta : NAN,
-        pose_valid ? pose.x : NAN, pose_valid ? pose.y : NAN, lift_position_deg(),
-        vertical ? height.sensor_height_in : height.filtered_distance_mm / 25.4, vertical);
+        pose_valid ? pose.x : NAN, pose_valid ? pose.y : NAN, lift_position_deg());
   }
   // Installed PROS misc.h: wireless writes faster than 50 ms may be discarded.
   // One row per 50 ms gives all three rows a reliable ~150 ms refresh.
@@ -41,18 +38,13 @@ void print_robot_telemetry() {
   lift_height_telemetry_update();
   const auto pose = nav_pose_get();
   const bool pose_valid = nav_sensors_ready();
-  const auto height = lift_height_calibration_sample();
   const auto tilt = anti_tip::snapshot();
   std::printf("2474V TELEMETRY\nPose X=%.3f Y=%.3f in H=%.3f deg valid=%d\n"
-              "IMU pitch=%.3f roll=%.3f deg valid=%d\nLift=%.3f deg\n"
-              "Distance raw=%.0f filtered=%.3f mm beam=%.3f in valid=%d confidence=%d\n"
-              "Sensor-face vertical=%.3f in claw-reference=%.3f in\n",
+              "IMU pitch=%.3f roll=%.3f deg valid=%d\nLIFT POSITION: %.1f deg\n",
               pose_valid ? pose.x : NAN, pose_valid ? pose.y : NAN,
               pose_valid ? pose.theta : NAN, pose_valid,
               tilt.orientation.pitch, tilt.orientation.roll, tilt.orientation.valid,
-              height.rotation_deg, height.raw_distance_mm, height.filtered_distance_mm,
-              height.filtered_distance_mm / 25.4, height.sensor_valid, height.confidence,
-              height.sensor_height_in, height.claw_reference_height_in);
+              lift_position_deg());
   anti_tip::print_snapshot();
 }
 void telemetry_monitor_test() {

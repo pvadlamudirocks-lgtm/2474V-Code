@@ -29,3 +29,17 @@ __pycache__/
 
 # Generated project archives
 EZ_Template_2474V_Victory_full_project_*.zip
+
+# Local investigation captures and redundant project/template exports.
+/output/
+/diagnostic_backups/
+/Victory_Code_For_ChatGPT.zip
+/EZ-Template@3.2.2.zip
+/.agents/
+/.codex/
+
+# Local credentials must never be included in audit snapshots.
+.env
+.env.*
+*.pem
+*.pfx

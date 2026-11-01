@@ -100,12 +100,6 @@ LiftHeightCalibrationSample lift_height_calibration_sample() {
 }
 void print_lift_height_calibration() {
   lift_height_telemetry_update();
-  const auto row = lift_height_calibration_sample();
-  std::printf("LIFT HEIGHT CALIBRATION t=%u ms\nRotation: %.2f deg\n"
-              "Raw beam distance: %.0f mm\nFiltered beam distance: %.2f mm\n"
-              "Sensor-face vertical height: %.2f in\nClaw reference height: %.2f in\n"
-              "Sensor valid: %s (does not identify floor); confidence=%d (-1 unavailable)\n",
-              row.timestamp_ms, row.rotation_deg, row.raw_distance_mm,
-              row.filtered_distance_mm, row.sensor_height_in, row.claw_reference_height_in,
-              row.sensor_valid ? "YES" : "NO", row.confidence);
+  std::printf("LIFT POSITION: %.1f deg (P%d; NaN = unavailable)\n",
+              lift_position_deg(), mechanism_config::LIFT_ROTATION_PORT);
 }

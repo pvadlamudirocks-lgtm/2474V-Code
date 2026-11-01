@@ -4,6 +4,8 @@
 #include "autons.hpp"
 #include "nav_diagnostics.hpp"
 #include "nav_sequence.hpp"
+#include "full_system_diag.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -86,7 +88,7 @@ const char* test_name(DevTest test) {
     NAME(DRIVE_FORWARD_12); NAME(TURN_90); NAME(GOTO_Y_12); NAME(GOTO_X_12);
     NAME(REVERSE_12); NAME(RETURN_TO_ORIGIN); NAME(TWO_POINT); NAME(SQUARE);
     NAME(GOTO_POSE); NAME(CHAIN_TWO_MOVE); NAME(PURE_PURSUIT_BASIC); NAME(MIRROR_MATH);
-    NAME(STABILITY_MONITOR);
+    NAME(STABILITY_MONITOR); NAME(FULL_SYSTEM_DIAG);
 #undef NAME
   }
   return "UNKNOWN";
@@ -95,11 +97,19 @@ const char* test_name(DevTest test) {
 // Common before/after reporting keeps primitive tests easy to compare.
 template <typename Motion>
 void measured_move(const char* label, ez::pose target, Motion motion) {
+  if (!ez::movement_ready()) {
+    std::printf("DEV MOVE SKIPPED: %s fault=%s\n",label,ez::movement_fault());
+    return;
+  }
   const auto start = nav_pose_get();
   nav_print_snapshot("BEFORE MOVE");
   const auto began = pros::millis();
   motion();
   const auto elapsed = pros::millis() - began;
+  if (!ez::movement_ready() || chassis.interfered) {
+    std::printf("DEV MOVE FAILED: %s fault=%s interfered=%d\n",label,ez::movement_fault(),chassis.interfered);
+    return;
+  }
   nav_print_test_result(label, start, target, elapsed);
 }
 void point(const char* label, double x, double y) {
@@ -110,6 +120,7 @@ void point(const char* label, double x, double y) {
 // ----- Primitive test dispatch -----
 // Run the selected foundation test; real route stages use the separate segment harness.
 void run_dev_test(DevTest test) {
+  if (test == DevTest::FULL_SYSTEM_DIAG) { run_full_system_diag(); return; }
   if (test == DevTest::STABILITY_MONITOR) {
     telemetry_monitor_test();
     return;
@@ -130,8 +141,16 @@ void run_dev_test(DevTest test) {
       return;
     }
   }
-  if (test == DevTest::SENSOR_HEALTH) {
+  if (test == DevTest::SENSOR_HEALTH || test == DevTest::MANUAL_ODOM) {
     nav_print_sensor_health();
+    std::printf("30-second read-only window; NO pose/sensor reset. NaN means unavailable.\n");
+    nav_manual_odom_sample(false);
+    const auto began = pros::millis();
+    while (pros::millis() - began < 30000 && !pros::competition::is_disabled()) {
+      nav_manual_odom_sample(true);
+      pros::delay(50);
+    }
+    nav_manual_odom_sample(false);
     return;
   }
   if (std::strcmp(name, "UNKNOWN") == 0) {
@@ -148,21 +167,16 @@ void run_dev_test(DevTest test) {
     return;
   }
   nav_set_start(0, 0, 0);
+  if (!nav_sensors_ready() || !nav_validate_pose(0,0,0,0.5,0.5)) {
+    ez::movement_cancel("start pose failed");
+    ez::movement_stop();
+    std::printf("DEV TEST ABORTED: start pose failed\n");
+    return;
+  }
   switch (test) {
     case DevTest::START_POSE:
       nav_print_snapshot("START POSE");
       return;
-    case DevTest::MANUAL_ODOM: {
-      std::printf("Manual push window: 30 seconds; +Y FRONT, +X RIGHT, clockwise heading positive.\n");
-      nav_manual_odom_sample(false);
-      const auto began = pros::millis();
-      while (pros::millis() - began < 30000 && !pros::competition::is_disabled()) {
-        nav_manual_odom_sample(true);
-        pros::delay(50);
-      }
-      nav_manual_odom_sample(false);
-      return;
-    }
     case DevTest::DRIVE_FORWARD_12:
       measured_move(name, {0, 12, ez::ANGLE_NOT_SET}, [] { nav_drive_distance(12, 40); });
       break;

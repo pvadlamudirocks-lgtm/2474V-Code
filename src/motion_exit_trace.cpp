@@ -4,11 +4,63 @@ void nav_observe_exit(ez::exit_output result);
 #include "motion_exit_trace.hpp"
 #include "path_motion_trace.hpp"
 #include "autons.hpp"
+#include "full_system_diag.hpp"
 #include <cstdio>
 #include <cmath>
 #include <utility>
+#include <atomic>
 
 namespace {
+// One blocking autonomous caller; capture only, never print inside native waits.
+struct DriveExitSample {
+  ez::exit_output reason=ez::RUNNING;
+  unsigned ms=0;
+  double error=NAN, derivative=NAN, secondary=NAN, rpm[2]={NAN,NAN};
+};
+DriveExitSample drive_exits[2];
+unsigned drive_wait_started=0;
+bool drive_exit_recording=false; // Only the blocking caller uses exit capture.
+struct MotorRow { double position=NAN, rpm=NAN; int mv=0, ma=0; };
+struct DriveRow {
+  unsigned ms=0;
+  int left=0,right=0;
+  double heading=NAN,left_pid=NAN,right_pid=NAN,heading_pid=NAN;
+  MotorRow motor[4];
+};
+DriveRow drive_rows[90]; // At most one sample/100 ms; no serial output while moving.
+std::atomic<unsigned> drive_row_count{0};
+std::atomic<bool> drive_sampling{false};
+void capture_drive_output(ez::Drive* drive,int left,int right) {
+  if(drive!=&chassis || !drive_sampling.load(std::memory_order_acquire)) return;
+  const unsigned count=drive_row_count.load(std::memory_order_relaxed);
+  const unsigned ms=pros::millis()-drive_wait_started;
+  if(count>=90 || (count && ms-drive_rows[count-1].ms<100)) return;
+  DriveRow row;
+  row.ms=ms; row.left=left; row.right=right; row.heading=drive->drive_imu_get();
+  row.left_pid=drive->leftPID.output; row.right_pid=drive->rightPID.output;
+  row.heading_pid=drive->headingPID.output;
+  for(unsigned side=0;side<2;++side) {
+    auto& motors=side ? drive->right_motors : drive->left_motors;
+    for(unsigned i=0;i<2 && i<motors.size();++i) {
+      auto& out=row.motor[side*2+i];
+      out.position=motors[i].get_position(); out.rpm=motors[i].get_actual_velocity();
+      out.mv=motors[i].get_voltage(); out.ma=motors[i].get_current_draw();
+    }
+  }
+  drive_rows[count]=row;
+  drive_row_count.store(count+1,std::memory_order_release);
+}
+void capture_drive_exit(ez::Drive* drive,bool left,int result) {
+  if(drive!=&chassis) return;
+  auto& out=drive_exits[left ? 0 : 1];
+  const auto& pid=left ? drive->leftPID : drive->rightPID;
+  out.reason=static_cast<ez::exit_output>(result);
+  out.ms=pros::millis()-drive_wait_started;
+  out.error=pid.error; out.derivative=pid.derivative;
+  out.secondary=(left ? drive->leftPID : drive->rightPID).velocity_sensor_secondary_get();
+  auto& motors=left ? drive->left_motors : drive->right_motors;
+  for(unsigned i=0;i<motors.size() && i<2;++i) out.rpm[i]=motors[i].get_actual_velocity();
+}
 struct Snapshot {
   ez::pose internal{0, 0, 0};
   ez::pose active{0, 0};
@@ -206,6 +258,17 @@ std::pair<ez::exit_output, ez::exit_output> pose_exit_trace_finish() {
 
 // GNU ld --wrap observes the exact overload used by native Drive::pid_wait().
 // Forward exactly once, preserve its result, and never call exit_condition again.
+extern "C" ez::exit_output __real__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(ez::PID*,pros::Motor,bool);
+extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(
+    ez::PID* pid,pros::Motor motor,bool print) {
+  const auto result=__real__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(pid,motor,print);
+  full_system_diag_exit(pid,result);
+  if(drive_exit_recording && result!=ez::RUNNING) {
+    if(pid==&chassis.leftPID) capture_drive_exit(&chassis,true,result);
+    else if(pid==&chassis.rightPID) capture_drive_exit(&chassis,false,result);
+  }
+  return result;
+}
 extern "C" ez::exit_output __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
     ez::PID*, std::vector<pros::Motor>, bool);
 extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
@@ -220,6 +283,7 @@ extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v5
     // VELOCITY_EXIT afterward would already have reset angular/current timers.
     pid->exit.velocity_exit_time = 0;
     const auto result = pid->exit_condition_turn_trace(std::move(motors), print);
+    full_system_diag_exit(pid,result);
     pid->exit.velocity_exit_time = velocity_exit_time;
     pid->velocity_sensor_secondary_toggle_set(secondary_enabled);
     nav_observe_exit(result);
@@ -228,6 +292,7 @@ extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v5
   }
   const auto result = __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
       pid, std::move(motors), print);
+  full_system_diag_exit(pid,result);
   nav_observe_exit(result);
   ez::MotionExitTrace::observe(pid, result);
   return result;
@@ -313,8 +378,66 @@ void motion_exit_trace_show() {
 // Execute its unchanged native wait instructions, with exit calls observed above.
 extern "C" void ez_trace_native_pid_wait(ez::Drive*);
 extern "C" void __wrap__ZN2ez5Drive8pid_waitEv(ez::Drive* drive) {
-  if (!ez::MotionExitTrace::wait_for_final_waypoint(*drive)) return;
-  ez_trace_native_pid_wait(drive);
+  const bool diagnose=drive==&chassis && drive->drive_mode_get()==ez::DRIVE && !full_system_diag_recording();
+  const bool interference_at_entry=drive->interfered;
+  const unsigned began=pros::millis();
+  double initial[4]={NAN,NAN,NAN,NAN};
+  double start_left=NAN,start_right=NAN,target_left=NAN,target_right=NAN,start_imu=NAN;
+  if(diagnose) {
+    drive_exits[0]={}; drive_exits[1]={}; drive_wait_started=began;
+    start_left=drive->drive_sensor_left(); start_right=drive->drive_sensor_right();
+    target_left=drive->leftPID.target_get(); target_right=drive->rightPID.target_get();
+    start_imu=drive->drive_imu_get();
+    for(unsigned i=0;i<2;++i) {
+      if(i<drive->left_motors.size()) initial[i]=drive->left_motors[i].get_position();
+      if(i<drive->right_motors.size()) initial[i+2]=drive->right_motors[i].get_position();
+    }
+    drive_exit_recording=true;
+    drive_row_count.store(0);
+    drive_sampling.store(true,std::memory_order_release);
+    ez::drive_telemetry_observer_set(capture_drive_output);
+  }
+  const bool printing=drive->pid_print_toggle_get();
+  drive->pid_print_toggle(false); // Stop before potentially blocking diagnostics.
+  if (ez::MotionExitTrace::wait_for_final_waypoint(*drive)) ez_trace_native_pid_wait(drive);
+  const unsigned wait_ms=pros::millis()-began;
+  if(diagnose) {
+    drive_exit_recording=false;
+    drive_sampling.store(false,std::memory_order_release);
+    ez::drive_telemetry_observer_set(nullptr);
+  }
+  const bool stopped=ez::movement_stop();
+  if (!stopped) drive->interfered = true;
+  if(drive->interfered) ez::movement_cancel("native movement failure");
+  drive->pid_print_toggle(printing);
+  if(diagnose) {
+    const double final_left=drive->drive_sensor_left(),final_right=drive->drive_sensor_right();
+    const auto pose=drive->odom_pose_get();
+    std::printf("DRIVE_DIAG wait_ms=%u through_stop_ms=%u stop_ack=%d fault=%s interfered=%d interfered_at_entry=%d\n"
+                "DRIVE_DIAG encoder_in L start=%.4f target=%.4f final=%.4f delta=%.4f error=%.4f | R start=%.4f target=%.4f final=%.4f delta=%.4f error=%.4f\n"
+                "DRIVE_DIAG imu_start=%.4f imu_final=%.4f pose=(%.4f,%.4f,%.4f)\n",
+                wait_ms,pros::millis()-began,stopped,ez::movement_fault(),drive->interfered,interference_at_entry,
+                start_left,target_left,final_left,final_left-start_left,target_left-final_left,
+                start_right,target_right,final_right,final_right-start_right,target_right-final_right,
+                start_imu,drive->drive_imu_get(),pose.x,pose.y,pose.theta);
+    for(unsigned side=0;side<2;++side) {
+      const auto& e=drive_exits[side];
+      std::printf("DRIVE_DIAG %s exit=%s at_ms=%u pid_error=%.4f derivative=%.6f secondary_accel=%.6f rpm_at_exit=(%.2f,%.2f)\n",
+                  side ? "R" : "L",reason_name(e.reason),e.ms,e.error,e.derivative,e.secondary,e.rpm[0],e.rpm[1]);
+      auto& motors=side ? drive->right_motors : drive->left_motors;
+      for(unsigned i=0;i<motors.size() && i<2;++i)
+        std::printf("DRIVE_DIAG motor_port=%d position_delta_native_units=%.4f rpm_after_stop=%.2f\n",
+                    motors[i].get_port(),motors[i].get_position()-initial[side*2+i],motors[i].get_actual_velocity());
+    }
+    std::printf("DRIVE_SAMPLE columns: ms,L_cmd,R_cmd,imu,L_PID,R_PID,H_PID; then L0,L1,R0,R1 each: position_native,rpm,voltage_readback_mV,current_mA\n");
+    const unsigned count=drive_row_count.load(std::memory_order_acquire);
+    for(unsigned i=0;i<count;++i) {
+      const auto& row=drive_rows[i];
+      std::printf("DRIVE_SAMPLE %u,%d,%d,%.3f,%.3f,%.3f,%.3f",row.ms,row.left,row.right,row.heading,row.left_pid,row.right_pid,row.heading_pid);
+      for(const auto& motor:row.motor) std::printf(",%.3f,%.2f,%d,%d",motor.position,motor.rpm,motor.mv,motor.ma);
+      std::printf("\n");
+    }
+  }
 }
 
 

@@ -5,11 +5,12 @@
 #include "EZ-Template/navigation_hooks.hpp"
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 namespace auton {
 namespace {
 // ----- Route ownership -----
 // One Session owns route commands and the event log until cleanup finishes.
-Session* owner = nullptr;
+std::atomic<Session*> owner{nullptr};
 unsigned motion_started = 0, motion_timeout = 0;
 Result wait_result = Result::PASS;
 auton_math::Pose pose() { const auto p=nav_pose_get(); return {p.x,p.y,p.theta}; }
@@ -24,7 +25,8 @@ bool wait_service(ez::Drive* drive) {
   else if (!sensors_ready()) wait_result=Result::SENSOR_FAULT;
   else if (pros::millis()-motion_started >= motion_timeout) wait_result=Result::TIMEOUT;
   if (wait_result!=Result::PASS) {
-    ez::navigation_lock(); chassis.drive_set(0,0); ez::navigation_unlock();
+    ez::movement_cancel("route movement interrupted");
+    if (!ez::movement_stop()) wait_result=Result::FAIL;
     return false;
   }
   // Deliberately no mechanism service: trusted primitive ownership is unchanged.
@@ -76,8 +78,9 @@ const char* segment_name(RouteSegmentTest s) {
 // ----- Route lifetime and abort -----
 // Clear earlier outputs on entry; latch failures so later Session commands cannot run.
 Session::Session(const char* route) {
-  if (owner || nav_sequence_active()) { result_=Result::ABORTED; return; }
-  owner=this;
+  Session* empty=nullptr;
+  if (nav_sequence_active() ||
+      !owner.compare_exchange_strong(empty,this)) { result_=Result::ABORTED; return; }
   nav_cancel_sequence();
   log_begin(route);
   log_event("AUTON_START","none","none",Result::RETURNED_UNVERIFIED);
@@ -169,6 +172,7 @@ Result Session::point(const char* name,double x,double y,int speed,unsigned time
 Result Session::turn(const char* name,double h,int speed,unsigned timeout) { return move(name,{NAN,NAN,h},speed,timeout,true,false); }
 Result Session::mechanism(const char* name,bool (*command)()) {
   if(!ok() || !command) return abort(Result::ABORTED,"mechanism ownership/request");
+  if(!sensors_ready()) return abort(Result::SENSOR_FAULT,"mechanism navigation preflight");
   const bool accepted=command();
   const auto r=accepted && enabled() ? Result::PASS : Result::FAIL;
   log_event("MECHANISM_COMMAND",segment_,name,r,{}, {},0,lift_position_deg());
@@ -176,7 +180,7 @@ Result Session::mechanism(const char* name,bool (*command)()) {
 }
 Result Session::stop_motion() {
   if(!ok() || nav_sequence_active()) return abort(Result::ABORTED,"stop ownership conflict");
-  ez::navigation_lock(); chassis.drive_set(0,0); ez::navigation_unlock();
+  if (!ez::movement_stop()) return abort(Result::FAIL,"stop acknowledgement timeout");
   return Result::PASS;
 }
 // ----- Optional chained movement -----

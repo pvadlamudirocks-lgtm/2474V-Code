@@ -3,6 +3,17 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cerrno>
+#include <atomic>
+
+namespace {
+std::atomic<bool> sensor_fault{false};
+std::atomic<unsigned> first_fault_ms{0};
+void latch_sensor_fault() {
+  if (!sensor_fault.exchange(true)) first_fault_ms.store(pros::millis());
+}
+}
+bool nav_sensor_fault_latched() { return sensor_fault.load(); }
 
 // ----- Navigation health -----
 // Silent checks are used during motion; the printed snapshot below is for setup.
@@ -10,11 +21,13 @@ bool nav_sensors_ready() {
   auto* h=chassis.odom_tracker_back;
   auto* v=chassis.odom_tracker_right;
   const auto p=nav_pose_get();
-  return chassis.imu.is_installed() && chassis.imu.get_status()!=pros::ImuStatus::error &&
+  const bool ready = chassis.imu.is_installed() && chassis.imu.get_status()!=pros::ImuStatus::error &&
       !chassis.imu.is_calibrating() && std::isfinite(chassis.imu.get_rotation()) &&
       h && v && h->smart_encoder.is_installed() && v->smart_encoder.is_installed() &&
       h->smart_encoder.get_position()!=PROS_ERR && v->smart_encoder.get_position()!=PROS_ERR &&
       std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.theta);
+  if (!ready) latch_sensor_fault();
+  return ready && !nav_sensor_fault_latched();
 }
 
 namespace {
@@ -166,79 +179,55 @@ bool nav_debug_result(double x, double y, double heading) {
 
 // Read-only manual-push telemetry. Never resets pose/sensors or commands motors.
 void nav_manual_odom_sample(bool enabled) {
-  static bool sampled = false;
-  static std::uint32_t last_ms = 0;
-  static double last_vertical = 0.0, last_horizontal = 0.0;
-  static ez::pose last_pose;
-  if (!enabled) {
-    sampled = false;
-    return;
-  }
-  const auto now = pros::millis();
+  static bool sampled = false, previous_valid[2] = {};
+  static unsigned last_ms = 0, first_invalid[3] = {};
+  static bool seen_invalid[3] = {};
+  static double previous[2] = {};
+  if (!enabled) { sampled = false; previous_valid[0] = previous_valid[1] = false; return; }
+  const unsigned now = pros::millis();
   if (sampled && now - last_ms < 250) return;
-  auto* vertical = chassis.odom_tracker_right;
-  auto* horizontal = chassis.odom_tracker_back;
-  if (vertical == nullptr || horizontal == nullptr) return;
-  if (!vertical->smart_encoder.is_installed() ||
-      !horizontal->smart_encoder.is_installed()) {
-    std::printf("MANUAL ODOM: TRACKER MISSING\n");
-    sampled = false; return;
+  last_ms = now; sampled = true; // Rate-limit failures as well as healthy samples.
+  ez::tracking_wheel* trackers[] = {chassis.odom_tracker_back, chassis.odom_tracker_right};
+  const char* labels[] = {"P5 HORIZONTAL BACK", "P7 VERTICAL RIGHT"};
+  for (int i = 0; i < 2; ++i) {
+    auto* t = trackers[i];
+    errno = 0;
+    const auto raw = t ? t->smart_encoder.get_position() : PROS_ERR;
+    const int error = t ? errno : ENODEV; // Capture immediately, before another API call.
+    const double tpi = t ? t->ticks_per_inch() : NAN;
+    const bool valid = raw != PROS_ERR && std::isfinite(tpi) && tpi > 0;
+    if (!valid) {
+      latch_sensor_fault();
+      if (!seen_invalid[i]) { seen_invalid[i] = true; first_invalid[i] = now; }
+    }
+    // Convert the SAME validated reading; do not reread via tracking_wheel::get().
+    const double distance = valid ? static_cast<double>(raw) / tpi : NAN;
+    const double delta = valid && previous_valid[i] ? static_cast<double>(raw) - previous[i] : NAN;
+    std::printf("ODOM ms=%u %s raw_cd=%ld valid=%d errno=%d d_raw_cd=%.0f distance_in=%.6f d_in=%.6f first_invalid_seen=%d first_invalid_ms=%u\n",
+        now, labels[i], static_cast<long>(raw), valid, error, delta, distance,
+        valid ? delta / tpi : NAN, seen_invalid[i], first_invalid[i]);
+    previous_valid[i] = valid;
+    if (valid) previous[i] = raw;
   }
-  const double raw_vertical = vertical->smart_encoder.get_position();
-  const double raw_horizontal = horizontal->smart_encoder.get_position();
-  if (raw_vertical == PROS_ERR || raw_horizontal == PROS_ERR ||
-      !std::isfinite(raw_vertical) || !std::isfinite(raw_horizontal) ||
-      !chassis.imu.is_installed() || chassis.imu.get_status() == pros::ImuStatus::error ||
-      chassis.imu.is_calibrating()) {
-    std::printf("MANUAL ODOM: SENSOR READ ERROR; sample omitted\n");
-    sampled = false; return;
+  const auto status = chassis.imu.get_status();
+  const bool calibrating = chassis.imu.is_calibrating();
+  errno = 0;
+  const double heading = chassis.imu.get_heading();
+  const int error = errno;
+  const bool imu_valid = status != pros::ImuStatus::error && !calibrating && std::isfinite(heading);
+  if (!imu_valid) {
+    latch_sensor_fault();
+    if (!seen_invalid[2]) { seen_invalid[2] = true; first_invalid[2] = now; }
   }
-  const auto ez_pose = chassis.odom_pose_get();
-  const auto public_pose = nav_internal_to_game_pose(ez_pose);
-  const double vertical_in = vertical->get(), horizontal_in = horizontal->get();
-  const double imu_heading = chassis.drive_imu_get();
-  if (!finite_pose(public_pose) || !std::isfinite(vertical_in) ||
-      !std::isfinite(horizontal_in) || !std::isfinite(imu_heading) ||
-      imu_heading == PROS_ERR_F ||
-      vertical->smart_encoder.get_position() == PROS_ERR ||
-      horizontal->smart_encoder.get_position() == PROS_ERR) {
-    std::printf("MANUAL ODOM: INVALID SAMPLE -- omitted\n");
-    sampled = false; return;
-  }
-  if (!sampled) {
-    std::printf("\n=== MANUAL PUSH DIAGNOSTIC ===\n"
-                "RAW values are Rotation API centidegrees (configured reversal included).\n"
-                "VERTICAL: RIGHT, port=%d reversed=%ld ticks/in=%.6f\n"
-                "HORIZONTAL: BACK, port=%d reversed=%ld ticks/in=%.6f\n"
-                "Deltas are since previous sample. Verify PUBLIC H~0 / EZ H~0.\n"
-                "No pose reset or motor command is issued by this diagnostic.\n",
-                vertical->smart_encoder.get_port(),
-                static_cast<long>(vertical->smart_encoder.get_reversed()),
-                vertical->ticks_per_inch(), horizontal->smart_encoder.get_port(),
-                static_cast<long>(horizontal->smart_encoder.get_reversed()),
-                horizontal->ticks_per_inch());
-    last_vertical = raw_vertical;
-    last_horizontal = raw_horizontal;
-    last_pose = ez_pose;
-  }
-  std::printf("ms=%lu | RAW VERTICAL: %.0f dRAW_V: %+.0f V_IN: %+.4f | "
-              "EZ Y: %+.4f dEZ_Y: %+.4f PUBLIC Y: %+.4f | "
-              "RAW HORIZONTAL: %.0f dRAW_H: %+.0f H_IN: %+.4f | "
-              "EZ X: %+.4f dEZ_X: %+.4f PUBLIC X: %+.4f | "
-              "EZ H: %.3f PUBLIC H: %.3f IMU H: %.3f\n",
-              static_cast<unsigned long>(now), raw_vertical,
-              raw_vertical - last_vertical, vertical_in,
-              ez_pose.y, ez_pose.y - last_pose.y, public_pose.y,
-              raw_horizontal, raw_horizontal - last_horizontal, horizontal_in,
-              ez_pose.x, ez_pose.x - last_pose.x, public_pose.x,
-              ez_pose.theta, public_pose.theta, imu_heading);
-  last_ms = now;
-  last_vertical = raw_vertical;
-  last_horizontal = raw_horizontal;
-  last_pose = ez_pose;
-  sampled = true;
+  const auto internal = chassis.odom_pose_get();
+  const auto public_pose = nav_internal_to_game_pose(internal);
+  if (!finite_pose(internal)) latch_sensor_fault();
+  std::printf("ODOM ms=%u P20 heading=%.6f valid=%d status=%u calibrating=%d errno=%d first_invalid_seen=%d first_invalid_ms=%u | EZ x=%.6f y=%.6f h=%.6f | PUBLIC x=%.6f y=%.6f h=%.6f | fault_latched=%d first_fault_ms=%u\n",
+      now, heading, imu_valid, static_cast<unsigned>(status), calibrating, error,
+      seen_invalid[2], first_invalid[2], internal.x, internal.y, internal.theta,
+      public_pose.x, public_pose.y, public_pose.theta, sensor_fault.load(), first_fault_ms.load());
+  std::fflush(stdout);
 }
-
 namespace {
 bool sensor_value_ok(double value) {
   return std::isfinite(value) && value != PROS_ERR && value != PROS_ERR_F;
@@ -283,11 +272,17 @@ bool nav_print_sensor_health() {
   }
   std::printf("================================\n");
   std::fflush(stdout);
-  return back && right && ready;
+  if (!(back && right && ready)) latch_sensor_fault();
+  const bool navigation_ready = nav_sensors_ready();
+  std::printf("NAV fault_latched=%d first_fault_ms=%u ready=%d (reboot required after fault)\n",
+      sensor_fault.load(), first_fault_ms.load(), navigation_ready);
+  return navigation_ready;
 }
 
 void nav_print_snapshot(const char* label) {
-  std::printf("\n=== %s ===\n", label);
+  const auto p = chassis.odom_pose_get();
+  std::printf("\n=== %s ms=%lu EZ x=%.6f y=%.6f h=%.6f ===\n", label,
+      static_cast<unsigned long>(pros::millis()), p.x, p.y, p.theta);
   nav_print_pose();
 }
 

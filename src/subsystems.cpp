@@ -10,12 +10,12 @@ using namespace mechanism_config;
 // existing odometry-only startup. A device is constructed only when requested.
 pros::Motor& left_lift_motor() {
   static pros::Motor motor(LEFT_LIFT_REVERSED ? -LEFT_LIFT_PORT : LEFT_LIFT_PORT,
-                           pros::v5::MotorGears::red);
+                           pros::v5::MotorGears::green);
   return motor;
 }
 pros::Motor& right_lift_motor() {
   static pros::Motor motor(RIGHT_LIFT_REVERSED ? -RIGHT_LIFT_PORT : RIGHT_LIFT_PORT,
-                           pros::v5::MotorGears::red);
+                           pros::v5::MotorGears::green);
   return motor;
 }
 pros::Motor& arm_motor() {
@@ -830,7 +830,7 @@ bool test_lift_motor_response(bool up_held, bool down_held) {
                   "Encoder delta: port14=%.3f port15=%.3f (configured encoder units)\n"
                   "Buffered RPM: port14=%.3f port15=%.3f | current mA: %.0f %.0f\n"
                   "Sample captured=%d at %u ms | lift sensor before=%.3f after=%.3f delta=%.3f deg\n"
-                  "Red 100 RPM (36:1 internal); external gearing 1:1. L1 up / L2 down. Release/both buttons stop.\n",
+                  "Green 200 RPM (18:1 internal); external gearing 1:1. L1 up / L2 down. Release/both buttons stop.\n",
                   direction > 0 ? "L1" : "L2", direction * voltage_mv, -direction * voltage_mv,
                   pros::millis() - started, stopped,
                   write_fault, motor14.get_position() - before14, motor15.get_position() - before15,
@@ -987,16 +987,20 @@ bool flex_stop() {
 }
 namespace {
 // ----- Toggle pair -----
-// Both P6/P19 motors share one command; configured reversals make their shafts cooperate.
+// Single-motor test commands only P19; otherwise the mirrored P6/P19 pair shares a command.
 bool toggle_command(bool reverse) {
   if (!toggle_available()) return false;
   if (pros::competition::is_disabled() || TOGGLE_POWER < 1 || TOGGLE_POWER > 127 ||
       (TOGGLE_DIRECTION != 1 && TOGGLE_DIRECTION != -1) ||
-      TOGGLE_REVERSED == TOGGLE_OTHER_REVERSED) { toggle_stop(); return false; }
+      (!TOGGLE_SINGLE_MOTOR_TEST && TOGGLE_REVERSED == TOGGLE_OTHER_REVERSED)) { toggle_stop(); return false; }
   const int command = TOGGLE_POWER * TOGGLE_DIRECTION * (reverse ? -1 : 1);
   const auto first = toggle_motor().move(command);
-  const auto second = toggle_other_motor().move(command);
-  if (first != PROS_ERR && second != PROS_ERR) return true;
+  if (TOGGLE_SINGLE_MOTOR_TEST) {
+    if (first != PROS_ERR) return true;
+  } else {
+    const auto second = toggle_other_motor().move(command);
+    if (first != PROS_ERR && second != PROS_ERR) return true;
+  }
   toggle_stop();
   return false;
 }
@@ -1006,6 +1010,7 @@ bool toggle_run_reverse() { return toggle_command(true); }
 bool toggle_stop() {
   if (!toggle_available()) return false;
   const auto first = toggle_motor().move_voltage(0);
+  if (TOGGLE_SINGLE_MOTOR_TEST) return first != PROS_ERR;
   const auto second = toggle_other_motor().move_voltage(0);
   return first != PROS_ERR && second != PROS_ERR;
 }
@@ -1078,7 +1083,8 @@ bool lift_move_calibrated_position(unsigned preset,unsigned timeout,LiftFinish f
   return p.configured && std::isfinite(p.degrees) && lift_auton_move_to_deg(p.degrees,timeout,finish);
 }
 bool toggle_connected() {
-  return toggle_available() && toggle_motor().is_installed() && toggle_other_motor().is_installed();
+  return toggle_available() && toggle_motor().is_installed() &&
+         (TOGGLE_SINGLE_MOTOR_TEST || toggle_other_motor().is_installed());
 }
 // ----- Route hardware snapshot -----
 // Report every mechanism, but only required devices can fail this route's preflight.
@@ -1090,7 +1096,8 @@ bool mechanisms_preflight(bool require_lift,bool require_toggle,bool require_fle
   std::printf("PREFLIGHT lift P%d/P%d motors=%d rotation P%d=%d target_ready=%d %s\n",
       LEFT_LIFT_PORT,RIGHT_LIFT_PORT,lift_motors,LIFT_ROTATION_PORT,lift_sensor_ok,lift_target_ready(),
       require_lift ? "REQUIRED FOR ROUTE" : "OPTIONAL");
-  std::printf("PREFLIGHT toggle P%d/P%d connected=%d %s\n",TOGGLE_PORT,TOGGLE_OTHER_PORT,toggle_ok,
+  std::printf("PREFLIGHT toggle P%d secondary=%d connected=%d %s\n",TOGGLE_PORT,
+      TOGGLE_SINGLE_MOTOR_TEST ? 0 : TOGGLE_OTHER_PORT,toggle_ok,
       require_toggle ? "REQUIRED FOR ROUTE" : "OPTIONAL");
   std::printf("PREFLIGHT flex P%d/P%d connected=%d %s\n",FLEX_LEFT_PORT,FLEX_RIGHT_PORT,flex_ok,
       require_flex ? "REQUIRED FOR ROUTE" : "OPTIONAL");

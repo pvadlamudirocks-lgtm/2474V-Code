@@ -10,10 +10,13 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #include "EZ-Template/path_trace_hook.hpp"
 #include <atomic>
 #include "EZ-Template/navigation_hooks.hpp"
+#include "EZ-Template/movement_limits.hpp"
 
 namespace {
 std::atomic<ez::PathTraceHook> path_trace_hook{nullptr};
 std::atomic<ez::CommandObserver> command_observer{nullptr};
+std::atomic<ez::DriveTelemetryObserver> drive_telemetry_observer{nullptr};
+std::atomic<ez::DiagnosticService> diagnostic_service{nullptr};
 pros::Mutex navigation_mutex;
 }
 void ez::path_trace_hook_set(PathTraceHook hook) {
@@ -21,18 +24,113 @@ void ez::path_trace_hook_set(PathTraceHook hook) {
 }
 
 void ez::command_observer_set(CommandObserver observer) { command_observer.store(observer); }
+void ez::drive_telemetry_observer_set(DriveTelemetryObserver observer) { drive_telemetry_observer.store(observer); }
+bool ez::diagnostic_service_set(DiagnosticService service) {
+  if(!service){diagnostic_service.store(nullptr);return true;}
+  DiagnosticService empty=nullptr;
+  return diagnostic_service.compare_exchange_strong(empty,service) || empty==service;
+}
 void ez::navigation_lock() { navigation_mutex.take(); }
 void ez::navigation_unlock() { navigation_mutex.give(); }
+bool ez::navigation_try_lock(unsigned timeout_ms) { return navigation_mutex.take(timeout_ms); }
+
+namespace {
+std::atomic<ez::MovementHealth> movement_health{nullptr};
+std::atomic<const char*> movement_failure{nullptr};
+std::atomic<unsigned> stop_requested{0}, stop_acknowledged{0};
+static_assert(std::atomic<unsigned>::is_always_lock_free);
+static_assert(std::atomic<const char*>::is_always_lock_free);
+// Only the existing drivetrain task accesses these two values.
+bool output_started=false;
+unsigned output_since=0;
+bool zero_motors(ez::Drive* drive) {
+  // Emergency path deliberately does not wait for navigation_mutex or change
+  // controller targets. Only this existing drivetrain task calls it.
+  bool ok=true;
+  for (auto* motors : {&drive->left_motors, &drive->right_motors})
+    for (auto& motor : *motors)
+      if(motor.move_voltage(0)==PROS_ERR) ok=false;
+  if(!ok) ez::movement_cancel("motor stop error");
+  return ok;
+}
+bool motor_feedback_valid(ez::Drive* drive) {
+  if(drive->left_motors.empty() || drive->right_motors.empty()) return false;
+  for(auto* motors : {&drive->left_motors,&drive->right_motors})
+    for(auto& motor:*motors)
+      if(!std::isfinite(motor.get_position()) || !std::isfinite(motor.get_actual_velocity())) return false;
+  return true;
+}
+// Under the controller lock; deadline is continuous across CHAIN handoffs.
+bool movement_tick(ez::Drive* drive) {
+  const unsigned request=stop_requested.load();
+  if(request!=stop_acknowledged.load()) {
+    if(auto service=diagnostic_service.load()) service(drive,ez::DiagnosticEvent::STOP);
+    drive->drive_set(0,0); output_started=false;
+    if(zero_motors(drive)) stop_acknowledged.store(request);
+    return false;
+  }
+  if(drive->drive_mode_get()==ez::DISABLE) {output_started=false;return true;}
+  if(!output_started){output_started=true;output_since=pros::millis();}
+  if(pros::competition::is_disabled() || !pros::competition::is_autonomous())
+    ez::movement_cancel("autonomous disabled or mode changed");
+  else if(ez::movement_expired(pros::millis(),output_since))
+    ez::movement_cancel("motion timeout");
+  else if(!movement_failure.load()) {
+    auto health=movement_health.load();
+    if(!health || !health() || !motor_feedback_valid(drive)) ez::movement_cancel("invalid sensor feedback");
+  }
+  // Sensor reads can span a deadline or mode transition.
+  if(ez::movement_expired(pros::millis(),output_since)) ez::movement_cancel("motion timeout");
+  if(pros::competition::is_disabled() || !pros::competition::is_autonomous())
+    ez::movement_cancel("autonomous disabled or mode changed");
+  if(movement_failure.load()) {
+    drive->interfered=true; drive->drive_set(0,0); zero_motors(drive);
+    output_started=false; return false;
+  }
+  return true;
+}
+}
+void ez::movement_health_set(MovementHealth health){movement_health.store(health);}
+void ez::movement_cancel(const char* reason){
+  const char* empty=nullptr; movement_failure.compare_exchange_strong(empty,reason);
+}
+const char* ez::movement_fault(){auto reason=movement_failure.load();return reason ? reason : "none";}
+bool ez::movement_ready(){
+  return !movement_failure.load() && stop_requested.load()==stop_acknowledged.load() &&
+    !pros::competition::is_disabled() && pros::competition::is_autonomous();
+}
+bool ez::movement_stop(){
+  const unsigned request=stop_requested.fetch_add(1)+1;
+  const unsigned began=pros::millis();
+  while(stop_acknowledged.load()!=request && pros::millis()-began<movement_stop_ms) pros::delay(1);
+  if(stop_acknowledged.load()==request)return true;
+  movement_cancel("stop acknowledgement timeout");return false;
+}
+bool ez::movement_begin_autonomous(){
+  if(!movement_stop())return false;
+  movement_failure.store(nullptr); // explicit new autonomous invocation only
+  return movement_ready();
+}
 using namespace ez;
 
 void Drive::ez_auto_task() {
   while (true) {
+    if(stop_requested.load()!=stop_acknowledged.load()) zero_motors(this);
     // Run odom
     ez_tracking_task();
 
-    navigation_lock();
+    if(!navigation_try_lock(movement_lock_ms)) {
+      if(output_started || pros::competition::is_autonomous() || stop_requested.load()!=stop_acknowledged.load()) {
+        zero_motors(this); movement_cancel("navigation lock timeout");
+      }
+      pros::delay(util::DELAY_TIME); continue;
+    }
     // Autonomous PID
-    switch (drive_mode_get()) {
+    const bool basic_allowed=movement_tick(this);
+    auto diagnostic=diagnostic_service.load();
+    if(diagnostic && !movement_ready()) diagnostic(this,DiagnosticEvent::STOP);
+    const bool diagnostic_allowed=!diagnostic || diagnostic(this,DiagnosticEvent::BEFORE_OUTPUT);
+    if (basic_allowed && diagnostic_allowed) switch (drive_mode_get()) {
       case DRIVE:
         drive_pid_task();
         break;
@@ -54,6 +152,8 @@ void Drive::ez_auto_task() {
         break;
     }
 
+    if(diagnostic) diagnostic(this,DiagnosticEvent::AFTER_OUTPUT);
+    movement_tick(this);
     navigation_unlock();
     // This is used to reset sensors for active braking
     util::AUTON_RAN = drive_mode_get() != DISABLE ? true : false;
@@ -101,10 +201,13 @@ void Drive::drive_pid_task() {
     r_out *= (max_slew_out / faster_side);
   }
 
+  // Reject invalid computed output before conversion to motor commands.
+  if (!std::isfinite(l_out) || !std::isfinite(r_out)) { movement_cancel("invalid controller output"); return; }
   // Set motors
   if (drive_toggle)
     private_drive_set(l_out, r_out);
   if (drive_toggle) if (auto observer = command_observer.load()) observer(this, l_out, r_out);
+  if (drive_toggle) if (auto observer = drive_telemetry_observer.load()) observer(this, l_out, r_out);
 }
 
 // Turn PID task
@@ -133,6 +236,8 @@ void Drive::turn_pid_task() {
       gyro_out = util::clamp(gyro_out, pid_turn_min_get(), -pid_turn_min_get());
   }
 
+  // Reject invalid computed output before conversion to motor commands.
+  if (!std::isfinite(gyro_out)) { movement_cancel("invalid controller output"); return; }
   // Set motors
   if (drive_toggle)
     private_drive_set(gyro_out, -gyro_out);
@@ -161,6 +266,7 @@ void Drive::swing_pid_task() {
 
   // Set the motors powers, and decide what to do with the "still" side of the drive
   double opposite_output = 0;
+  if (!std::isfinite(swing_out) || !std::isfinite(max_speed) || max_speed==0) { movement_cancel("invalid controller output"); return; }
   double scale = swing_out / max_speed;
   if (drive_toggle) {
     // Check if left or right swing, then set motors accordingly
@@ -236,6 +342,8 @@ void Drive::ptp_task() {
   // printf("xy(%.2f, %.2f, %.2f)   xyPID: %.2f   aPID: %.2f     dir: %i   sgn: %i   past_target: %i    is_past_target: %i   is_past_using_xy: %i      fake_xy(%.2f, %.2f, %.2f)\n", odom_x_get(), odom_y_get(), odom_theta_get(), xyPID.target_get(), current_a_odomPID.target_get(), dir, flipped, past_target, (int)is_past_target(odom_target, odom_pose_get()), is_past_target_using_xy, fake_x, fake_y, util::to_deg(fake_angle));
   // printf("xy(%.2f, %.2f, %.2f)   xyPID: %.2f   aPID: %.2f   ptf:(%.2f, %.2f)   xy/a(%.2f, %.2f)   lr(%.2f, %.2f)   fake xy: %.2f\n", odom_x_get(), odom_y_get(), odom_theta_get(), xyPID.error, current_a_odomPID.error, ptf.x, ptf.y, xy_out, a_out, l_out, r_out, new_current_fake);
 
+  // Reject invalid computed output before conversion to motor commands.
+  if (!std::isfinite(l_out) || !std::isfinite(r_out)) { movement_cancel("invalid controller output"); return; }
   // Set motors
   if (drive_toggle)
     private_drive_set(l_out, r_out);

@@ -1,5 +1,7 @@
 #pragma once
 bool nav_sensors_ready(); // Read-only, no prints; required IMU and both trackers.
+// Observed faults remain latched until reboot; never cleared by pose resets.
+bool nav_sensor_fault_latched();
 #include "navigation.hpp"
 
 // Read-only device checks; false means missing, calibrating, or unreadable.

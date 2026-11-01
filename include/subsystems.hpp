@@ -6,16 +6,16 @@ namespace mechanism_config {
 // ----- Wiring and physical directions -----
 // Change assignments here after checking the robot, rather than in route functions.
 // Legacy distance_correction.cpp is excluded; its P11/P12 placeholders are obsolete.
-constexpr int LEFT_LIFT_PORT = 14; // Left lift motor: red cartridge, 100 RPM.
-constexpr int RIGHT_LIFT_PORT = 15; // Right lift motor: red cartridge, 100 RPM.
+constexpr int LEFT_LIFT_PORT = 14; // Left lift motor: green cartridge, 200 RPM.
+constexpr int RIGHT_LIFT_PORT = 15; // Right lift motor: green cartridge, 200 RPM.
 constexpr int LIFT_ROTATION_PORT = 16;
-// Confirmed build specification: red cartridges use 36:1 internal gearing, 100 RPM.
+// Green cartridges use 18:1 internal gearing, 200 RPM.
 // Confirmed external gearing is 1:1: one output revolution per motor revolution.
 // Documentation only: manual control uses voltage, not a requested output RPM.
-constexpr double LIFT_MOTOR_RPM = 100.0;
+constexpr double LIFT_MOTOR_RPM = 200.0;
 constexpr double LIFT_SPEED_UP_RATIO = 1.0; // Output speed / motor speed; no scaling.
-constexpr double LIFT_OUTPUT_RPM = LIFT_MOTOR_RPM; // 100 RPM nominal at 1:1, not measured.
-// Keep both PROS lift motors configured as MotorGears::red (36:1, 100 RPM).
+constexpr double LIFT_OUTPUT_RPM = LIFT_MOTOR_RPM; // 200 RPM nominal at 1:1, not measured.
+// Keep both PROS lift motors configured as MotorGears::green (18:1, 200 RPM).
 constexpr int ARM_MOTOR_PORT = 17;
 constexpr int ARM_ROTATION_PORT = 0; // Retired P18 sensor remains unbound.
 constexpr int CLAW_DISTANCE_PORT = 0; // Retired P19 sensor remains unbound.
@@ -47,6 +47,7 @@ constexpr int FLEX_INTAKE_POWER = 0; // Uncommissioned; choose power during test
 constexpr int FLEX_OUTTAKE_POWER = 0; // Uncommissioned; no tuned speed assumed.
 // Current toggle pair is P6/P19; direction settings apply to every toggle command.
 constexpr bool TOGGLE_CONFIGURED = true;
+constexpr bool TOGGLE_SINGLE_MOTOR_TEST = true; // Temporary: only P19; false restores the pair.
 constexpr int TOGGLE_PORT = 19;
 constexpr int TOGGLE_OTHER_PORT = 6;
 constexpr bool TOGGLE_OTHER_REVERSED = false; // Opposite shaft direction to P19.

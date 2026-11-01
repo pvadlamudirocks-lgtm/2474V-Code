@@ -12,6 +12,7 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 namespace { std::atomic<ez::WaitService> wait_service{nullptr}; }
 void ez::wait_service_set(WaitService service) { wait_service.store(service); }
 bool ez::wait_service_tick(Drive* drive) {
+  if (!movement_ready()) return false;
   auto service = wait_service.load();
   return !service || service(drive);
 }

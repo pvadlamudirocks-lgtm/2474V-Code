@@ -145,13 +145,14 @@ namespace {
 void capture_controller(Row& row) { ez::NavAccess::capture_controller(row); }
 }
 
-bool nav_ok() { return active && !fault && !chassis.interfered; }
+bool nav_ok() { return active && !fault && !chassis.interfered && ez::movement_ready(); }
 bool nav_sequence_active() { return active; }
 const char* nav_fault() { return fault ? fault : chassis.interfered ? "EZ interference" : "none"; }
 void nav_abort(const char* reason) {
   if (!fault) fault = reason;
+  ez::movement_cancel(reason);
   pending = false;
-  ez::navigation_lock(); chassis.drive_set(0, 0); ez::navigation_unlock();
+  if (!ez::movement_stop()) fault = "stop acknowledgement timeout";
   stop_all_mechanisms();
   sample(FAILURE);
 }
@@ -203,6 +204,7 @@ bool verify_rest() {
   const auto began = pros::millis();
   while (pros::millis() - began < 2000) {
     if (pros::competition::is_disabled() || !pros::competition::is_autonomous()) return false;
+    if (!nav_sensors_ready() || !ez::movement_ready()) return false;
     mechanisms_update();
     sample();
     const bool stopped = rest(chassis.left_motors) && rest(chassis.right_motors);
@@ -225,7 +227,7 @@ NavSequence::NavSequence(bool trace, unsigned deadline) {
   owner_ = true; active = true; fault = nullptr;
   pending = busy = waiting = false; rest_verified = false;
   queued.clear(); events.clear(); fired.clear();
-  ez::navigation_lock(); chassis.drive_set(0, 0); ez::navigation_unlock();
+  if (!ez::movement_stop()) fault = "stop acknowledgement timeout";
   stop_all_mechanisms();
   chassis.interfered = false; // Explicit new sequence only; never per movement.
   print_before = chassis.pid_print_toggle_get(); chassis.pid_print_toggle(false);
@@ -241,7 +243,8 @@ bool NavSequence::finish() {
   // A route may end after CHAIN. Restore its real endpoint before the final wait.
   if (!owner_) return false;
   if (pending && nav_ok()) {
-    ez::navigation_lock(); ez::NavAccess::restore_target(); ez::navigation_unlock();
+    if(!ez::navigation_try_lock(10)) { nav_abort("navigation lock timeout"); }
+    else { ez::NavAccess::restore_target(); ez::navigation_unlock(); }
     pending = false; waiting = true; started = pros::millis();
     events.clear(); fired.clear();
     chassis.pid_wait(); waiting = false;
@@ -249,9 +252,9 @@ bool NavSequence::finish() {
   }
   if (!queued.empty()) nav_abort("unconsumed events");
   if (!fault && !verify_rest()) nav_abort("rest timeout");
-  ez::navigation_lock(); chassis.drive_set(0, 0); ez::navigation_unlock();
+  if (!ez::movement_stop()) fault = "stop acknowledgement timeout";
   // Drain a possible in-flight native tick, then reassert the boundary stop.
-  pros::delay(20); ez::navigation_lock(); chassis.drive_set(0, 0); ez::navigation_unlock();
+  pros::delay(20); if (!ez::movement_stop()) fault = "stop acknowledgement timeout";
   command_left.store(0); command_right.store(0);
   rest_verified = verify_rest();
   if (!rest_verified) nav_abort("final rest not verified");
@@ -274,12 +277,13 @@ void nav_trace_marker() { sample(ACTION); }
 bool nav_detail::move(const std::function<void()>& dispatch, NavEndMode end,
                       ez::pose requested, double, bool encoder, bool turn) {
   if (!nav_ok()) return false;
+  if (!nav_sensors_ready()) { nav_abort("navigation sensor preflight"); return false; }
   if (busy) { nav_abort("recursive navigation from event"); return false; }
   busy = true; pending = false; encoder_motion = encoder; turn_motion = turn;
   target = requested; previous_pose = nav_pose_get(); traveled = 0;
   events = std::move(queued); queued.clear(); fired.assign(events.size(), false);
   started = pros::millis(); ++movement;
-  ez::navigation_lock();
+  if(!ez::navigation_try_lock(10)) { busy=false; nav_abort("navigation lock timeout"); return false; }
   peak_left_command.store(0); peak_right_command.store(0); command_samples.store(0);
   command_left.store(0); command_right.store(0); command_ms.store(0);
   dispatch(); ez::NavAccess::save_targets();
@@ -368,7 +372,7 @@ void nav_trace_dump() {
 void nav_cancel_sequence() {
   // PROS competition lifecycle has stopped the old autonomous task before reuse.
   ez::wait_service_set(nullptr); ez::command_observer_set(nullptr);
-  ez::navigation_lock(); chassis.drive_set(0,0); ez::navigation_unlock();
+  if (!ez::movement_stop()) fault = "stop acknowledgement timeout";
   stop_all_mechanisms();
   if (active) { fault = "competition mode changed"; chassis.pid_print_toggle(print_before); }
   active = waiting = busy = pending = false;

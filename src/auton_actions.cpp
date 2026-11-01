@@ -43,6 +43,7 @@ void print_record(const Record& r, Context c) {
 template <typename Call>
 ActionResult movement(ez::pose target, Context c, Call call) {
   if (cancelled()) return reject(Status::Cancelled, c);
+  if (!nav_sensors_ready()) return reject(Status::Failed, c);
   const auto start = nav_pose_get();
   const auto began = pros::millis();
   const bool accepted = call();
@@ -64,6 +65,7 @@ ActionResult callback(const MechanismAction& action, bool enabled, Context c) {
   if (!enabled) return reject(Status::Disabled, c);
   if (!action) return reject(Status::InvalidRequest, c);
   if (cancelled()) return reject(Status::Cancelled, c);
+  if (!nav_sensors_ready()) return reject(Status::Failed, c);
   const auto began = pros::millis();
   const bool accepted = action(); // Caller supplies a short existing subsystem API call.
   const auto status = cancelled() ? Status::Cancelled :

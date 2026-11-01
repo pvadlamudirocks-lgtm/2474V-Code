@@ -48,7 +48,7 @@ TEMPLATE_FILES=$(INCDIR)/**/*.h $(INCDIR)/**/*.hpp
 -include ./common.mk
 
 # Observe native exit results without replacing the PID or wait implementations.
-$(HOT_ELF): private LDFLAGS += -Wl,--wrap=_ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb -Wl,--wrap=_ZN2ez5Drive8pid_waitEv
+$(HOT_ELF): private LDFLAGS += -Wl,--wrap=_ZN2ez3PID14exit_conditionEN4pros2v55MotorEb -Wl,--wrap=_ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb -Wl,--wrap=_ZN2ez5Drive8pid_waitEv
 
 # Link the original EZ wait machine code into the hot image so its
 # exit-check calls can be observed. The rest of EZ remains in the cold image.
@@ -60,7 +60,7 @@ $(HOT_ELF): $(BINDIR)/exit_conditions.cpp.o
 # EZ v3.2.2 PID.cpp, with only the integral sign-reset comparison corrected.
 # Replace the archive member so cold-image controllers also use the correction.
 # Source: https://github.com/EZ-Robotics/EZ-Template/blob/v3.2.2/src/EZ-Template/PID.cpp
-$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp Makefile
+$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp $(INCDIR)/EZ-Template/movement_limits.hpp Makefile
 	mkdir -p $(BINDIR)/ez_pid_patch
 	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/PID.cpp.o $<
 	$(AR) r $@ $(BINDIR)/ez_pid_patch/PID.cpp.o

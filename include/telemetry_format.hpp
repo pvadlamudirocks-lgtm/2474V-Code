@@ -45,7 +45,7 @@ constexpr Row pair(char a, Text first, char b, Text second, char unit, bool labe
   return row;
 }
 constexpr std::array<Row, 3> dashboard(double heading, double x, double y,
-                                      double lift, double distance_in, bool /*vertical*/) {
+                                      double lift) {
   if (!stability::finite(heading) || heading < 0 || heading >= 360) heading = stability::invalid;
   else if (heading >= 359.5) heading = 0; // Display rounding only, canonical heading unchanged.
   std::array<Row, 3> rows{};
@@ -53,12 +53,10 @@ constexpr std::array<Row, 3> dashboard(double heading, double x, double y,
   // UTF-8 degree-glyph rendering is unverified on V5; use the clear ASCII fallback.
   rows[1] = pair('H', number(heading, 0, 3), 'L', number(lift, 0, 7), 'd', true);
   auto& row = rows[2]; for (unsigned i = 0; i < 15; ++i) row[i] = ' ';
-  row[0] = 'H'; row[1] = 't'; row[2] = ' '; unsigned pos = 3;
-  const auto height = number(distance_in, 2, 7);
-  for (unsigned i = 0; i < height.size; ++i) row[pos++] = height.data[i];
-  if (stability::finite(distance_in)) {
-    row[pos++] = 'i'; row[pos++] = 'n';
-  }
+  row[0]='L'; row[1]='i'; row[2]='f'; row[3]='t'; row[4]=' '; unsigned pos=5;
+  const auto position = number(lift, 1, 6);
+  for (unsigned i=0;i<position.size;++i) row[pos++]=position.data[i];
+  row[pos++]=' '; row[pos++]='d'; row[pos++]='e'; row[pos++]='g';
   return rows;
 }
 }
