@@ -1,6 +1,7 @@
 #include "auton_actions.hpp"
 #include "nav_diagnostics.hpp"
 #include "subsystems.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 #include <cmath>
 #include <cstdio>
 
@@ -24,7 +25,7 @@ ActionResult reject(Status status, Context c) {
   return {status};
 }
 bool cancelled() {
-  return pros::competition::is_disabled() || !pros::competition::is_autonomous();
+  return ez::autonomous_cancelled();
 }
 struct Record {
   ez::pose start, target, final;
@@ -43,7 +44,7 @@ void print_record(const Record& r, Context c) {
 template <typename Call>
 ActionResult movement(ez::pose target, Context c, Call call) {
   if (cancelled()) return reject(Status::Cancelled, c);
-  if (!nav_sensors_ready()) return reject(Status::Failed, c);
+
   const auto start = nav_pose_get();
   const auto began = pros::millis();
   const bool accepted = call();
@@ -65,7 +66,7 @@ ActionResult callback(const MechanismAction& action, bool enabled, Context c) {
   if (!enabled) return reject(Status::Disabled, c);
   if (!action) return reject(Status::InvalidRequest, c);
   if (cancelled()) return reject(Status::Cancelled, c);
-  if (!nav_sensors_ready()) return reject(Status::Failed, c);
+
   const auto began = pros::millis();
   const bool accepted = action(); // Caller supplies a short existing subsystem API call.
   const auto status = cancelled() ? Status::Cancelled :
@@ -115,7 +116,7 @@ ActionResult approach_goal(FieldPoint p, int speed, Context c) {
 }
 ActionResult follow_path(const std::vector<nav_waypoint>& points, int speed,
                          std::optional<double> heading, nav_path_direction direction, Context c) {
-  if (!ENABLE_ADVANCED_PATHS) return reject(Status::Disabled,c);
+
   if (points.empty() || !speed_ok(speed) || !direction_ok(direction) ||
       (heading && !std::isfinite(*heading))) return reject(Status::InvalidRequest,c);
   for (const auto& p : points)
@@ -128,7 +129,7 @@ ActionResult follow_path(const std::vector<nav_waypoint>& points, int speed,
 // ----- Multi-step actions -----
 // Check the whole request before moving; NavSequence owns the actual handoffs.
 ActionResult run_sequence(const std::vector<SequenceStep>& steps, Context c) {
-  if (!ENABLE_ADVANCED_PATHS) return reject(Status::Disabled,c);
+
   if (steps.empty() || steps.back().finish != NavEndMode::SETTLE)
     return reject(Status::InvalidRequest,c);
   bool previous_chain = false;

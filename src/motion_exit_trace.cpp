@@ -4,7 +4,7 @@ void nav_observe_exit(ez::exit_output result);
 #include "motion_exit_trace.hpp"
 #include "path_motion_trace.hpp"
 #include "autons.hpp"
-#include "full_system_diag.hpp"
+
 #include <cstdio>
 #include <cmath>
 #include <utility>
@@ -19,6 +19,7 @@ struct DriveExitSample {
 };
 DriveExitSample drive_exits[2];
 unsigned drive_wait_started=0;
+bool drive_diagnostic_requested=false;
 bool drive_exit_recording=false; // Only the blocking caller uses exit capture.
 struct MotorRow { double position=NAN, rpm=NAN; int mv=0, ma=0; };
 struct DriveRow {
@@ -262,7 +263,7 @@ extern "C" ez::exit_output __real__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(e
 extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(
     ez::PID* pid,pros::Motor motor,bool print) {
   const auto result=__real__ZN2ez3PID14exit_conditionEN4pros2v55MotorEb(pid,motor,print);
-  full_system_diag_exit(pid,result);
+
   if(drive_exit_recording && result!=ez::RUNNING) {
     if(pid==&chassis.leftPID) capture_drive_exit(&chassis,true,result);
     else if(pid==&chassis.rightPID) capture_drive_exit(&chassis,false,result);
@@ -273,26 +274,10 @@ extern "C" ez::exit_output __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v5
     ez::PID*, std::vector<pros::Motor>, bool);
 extern "C" ez::exit_output __wrap__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
     ez::PID* pid, std::vector<pros::Motor> motors, bool print) {
-  if (pid == &chassis.turnPID && chassis.drive_mode_get() == ez::TURN) {
-    // Linear acceleration is not a stall measurement for an in-place turn.
-    // Scope the native toggle to this evaluation; other modes retain their setting.
-    const bool secondary_enabled = pid->velocity_sensor_secondary_toggle_get();
-    const int velocity_exit_time = pid->exit.velocity_exit_time;
-    pid->velocity_sensor_secondary_toggle_set(false);
-    // Skip both velocity branches only for this TURN evaluation. Discarding a
-    // VELOCITY_EXIT afterward would already have reset angular/current timers.
-    pid->exit.velocity_exit_time = 0;
-    const auto result = pid->exit_condition_turn_trace(std::move(motors), print);
-    full_system_diag_exit(pid,result);
-    pid->exit.velocity_exit_time = velocity_exit_time;
-    pid->velocity_sensor_secondary_toggle_set(secondary_enabled);
-    nav_observe_exit(result);
-    turn_velocity_trace_record_result(result);  // Observe only; return the same native result.
-    return result;
-  }
   const auto result = __real__ZN2ez3PID14exit_conditionESt6vectorIN4pros2v55MotorESaIS4_EEb(
       pid, std::move(motors), print);
-  full_system_diag_exit(pid,result);
+
+  if(pid==&chassis.turnPID)turn_velocity_trace_record_result(result);
   nav_observe_exit(result);
   ez::MotionExitTrace::observe(pid, result);
   return result;
@@ -323,7 +308,7 @@ void motion_exit_trace_finish() {
   recording = false;
   armed = false;
   // Preserve the wait-return snapshot, then stop residual PID output for this test.
-  chassis.drive_set(0, 0);
+  ez::drive_stop(&chassis);
   chassis.pid_print_toggle(previous_print);
 }
 void motion_exit_trace_show() {
@@ -376,9 +361,11 @@ void motion_exit_trace_show() {
 }
 // Only the original object's entry-point symbol is renamed by objcopy.
 // Execute its unchanged native wait instructions, with exit calls observed above.
+void drive_diagnostic_arm(){drive_diagnostic_requested=true;}
 extern "C" void ez_trace_native_pid_wait(ez::Drive*);
 extern "C" void __wrap__ZN2ez5Drive8pid_waitEv(ez::Drive* drive) {
-  const bool diagnose=drive==&chassis && drive->drive_mode_get()==ez::DRIVE && !full_system_diag_recording();
+  const bool diagnose=drive_diagnostic_requested && drive==&chassis && drive->drive_mode_get()==ez::DRIVE;
+  drive_diagnostic_requested=false;
   const bool interference_at_entry=drive->interfered;
   const unsigned began=pros::millis();
   double initial[4]={NAN,NAN,NAN,NAN};
@@ -398,7 +385,7 @@ extern "C" void __wrap__ZN2ez5Drive8pid_waitEv(ez::Drive* drive) {
     ez::drive_telemetry_observer_set(capture_drive_output);
   }
   const bool printing=drive->pid_print_toggle_get();
-  drive->pid_print_toggle(false); // Stop before potentially blocking diagnostics.
+  if(diagnose)drive->pid_print_toggle(false); // Only the explicit diagnostic changes print settings.
   if (ez::MotionExitTrace::wait_for_final_waypoint(*drive)) ez_trace_native_pid_wait(drive);
   const unsigned wait_ms=pros::millis()-began;
   if(diagnose) {
@@ -406,17 +393,17 @@ extern "C" void __wrap__ZN2ez5Drive8pid_waitEv(ez::Drive* drive) {
     drive_sampling.store(false,std::memory_order_release);
     ez::drive_telemetry_observer_set(nullptr);
   }
-  const bool stopped=ez::movement_stop();
-  if (!stopped) drive->interfered = true;
-  if(drive->interfered) ez::movement_cancel("native movement failure");
-  drive->pid_print_toggle(printing);
+  if(diagnose)ez::drive_stop(drive); // Explicit DRIVE Dev Test boundary only.
+
+
+  if(diagnose)drive->pid_print_toggle(printing);
   if(diagnose) {
     const double final_left=drive->drive_sensor_left(),final_right=drive->drive_sensor_right();
     const auto pose=drive->odom_pose_get();
-    std::printf("DRIVE_DIAG wait_ms=%u through_stop_ms=%u stop_ack=%d fault=%s interfered=%d interfered_at_entry=%d\n"
+    std::printf("DRIVE_DIAG wait_ms=%u through_stop_ms=%u interfered=%d interfered_at_entry=%d\n"
                 "DRIVE_DIAG encoder_in L start=%.4f target=%.4f final=%.4f delta=%.4f error=%.4f | R start=%.4f target=%.4f final=%.4f delta=%.4f error=%.4f\n"
                 "DRIVE_DIAG imu_start=%.4f imu_final=%.4f pose=(%.4f,%.4f,%.4f)\n",
-                wait_ms,pros::millis()-began,stopped,ez::movement_fault(),drive->interfered,interference_at_entry,
+                wait_ms,pros::millis()-began,drive->interfered,interference_at_entry,
                 start_left,target_left,final_left,final_left-start_left,target_left-final_left,
                 start_right,target_right,final_right,final_right-start_right,target_right-final_right,
                 start_imu,drive->drive_imu_get(),pose.x,pose.y,pose.theta);

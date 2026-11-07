@@ -17,7 +17,7 @@ EXTRA_CFLAGS=
 EXTRA_CXXFLAGS=-Wno-deprecated-enum-enum-conversion
 
 # Set to 1 to enable hot/cold linking
-USE_PACKAGE:=1
+USE_PACKAGE:=0
 
 # Add libraries you do not wish to include in the cold image here
 EXCLUDE_COLD_LIBRARIES:= 
@@ -60,7 +60,7 @@ $(HOT_ELF): $(BINDIR)/exit_conditions.cpp.o
 # EZ v3.2.2 PID.cpp, with only the integral sign-reset comparison corrected.
 # Replace the archive member so cold-image controllers also use the correction.
 # Source: https://github.com/EZ-Robotics/EZ-Template/blob/v3.2.2/src/EZ-Template/PID.cpp
-$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp $(INCDIR)/EZ-Template/movement_limits.hpp Makefile
+$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp $(INCDIR)/geometry_turn_deadline.hpp Makefile
 	mkdir -p $(BINDIR)/ez_pid_patch
 	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/PID.cpp.o $<
 	$(AR) r $@ $(BINDIR)/ez_pid_patch/PID.cpp.o

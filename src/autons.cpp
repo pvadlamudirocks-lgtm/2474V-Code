@@ -12,6 +12,7 @@
 #include "main.h"
 #include "navigation.hpp"
 #include "motion_exit_trace.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 
 namespace {
 constexpr int OFFSET_CALIBRATION_ITERATIONS = 10;
@@ -271,12 +272,15 @@ void odom_geometry_turn_90_test() {
   pros::lcd::set_text(6, "RUNNING - SPEED 40");
 
   chassis.drive_set(0, 0);
-  auto* back = chassis.odom_tracker_back;
-  auto* right = chassis.odom_tracker_right;
-  if (back == nullptr || right == nullptr ||
-      !back->smart_encoder.is_installed() || !right->smart_encoder.is_installed()) {
+  auto* front = chassis.odom_tracker_front;
+  auto* left = chassis.odom_tracker_left;
+  const bool front_connected = front && front->smart_encoder.is_installed();
+  const bool left_connected = left && left->smart_encoder.is_installed();
+  if (!front_connected || !left_connected) {
     pros::lcd::set_text(6, "STOPPED: tracker missing");
-    std::printf("RAW TURN TEST ABORTED: BACK/RIGHT rotation sensor missing.\n");
+    pros::lcd::print(7,"P5 FRONT:%s P7 LEFT:%s",front_connected?"OK":"MISSING",left_connected?"OK":"MISSING");
+    std::printf("RAW TURN TEST ABORTED: P5 FRONT=%s; P7 LEFT=%s.\n",
+                front_connected?"connected":"missing",left_connected?"connected":"missing");
     return;
   }
   chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
@@ -287,61 +291,97 @@ void odom_geometry_turn_90_test() {
   const auto start = chassis.odom_pose_get();
   // Direct Rotation sensor accumulated position, in signed centidegrees.
   // EZ tracking_wheel::get_raw() delegates to this same get_position() API.
-  const double back_raw_start = back->smart_encoder.get_position();
-  const double right_raw_start = right->smart_encoder.get_position();
-  const double back_tpi = back->ticks_per_inch();
-  const double right_tpi = right->ticks_per_inch();
+  const double front_raw_start = front->smart_encoder.get_position();
+  const double left_raw_start = left->smart_encoder.get_position();
+  const double front_tpi = front->ticks_per_inch();
+  const double left_tpi = left->ticks_per_inch();
   const double imu_start = chassis.drive_imu_get();
-  pros::lcd::print(6, "B cd: %.0f -> ...", back_raw_start);
-  pros::lcd::print(7, "R cd: %.0f -> ...", right_raw_start);
+  const auto valid_sample = [](double value) {
+    return std::isfinite(value) && value != PROS_ERR && value != PROS_ERR_F;
+  };
+  if (!valid_sample(front_raw_start) || !valid_sample(left_raw_start) ||
+      !valid_sample(front_tpi) || front_tpi <= 0 ||
+      !valid_sample(left_tpi) || left_tpi <= 0 || !valid_sample(imu_start)) {
+    pros::lcd::set_text(6,"STOPPED: invalid sample");
+    pros::lcd::print(7,"P5 %.0f P7 %.0f cd",front_raw_start,left_raw_start);
+    std::printf("RAW TURN TEST ABORTED: P5 FRONT raw=%.0f tpi=%.6f; P7 LEFT raw=%.0f tpi=%.6f; IMU=%.5f. Invalid samples are not converted.\n",
+                front_raw_start,front_tpi,left_raw_start,left_tpi,imu_start);
+    return;
+  }
+  pros::lcd::print(6, "F cd: %.0f -> ...", front_raw_start);
+  pros::lcd::print(7, "L cd: %.0f -> ...", left_raw_start);
   std::printf("\nROBOT FRAME: 90 DEG TURN | speed 40\n");
   std::printf("RAW DIAGNOSTIC: cd = signed sensor centidegrees, 36000/revolution.\n");
-  std::printf("BACK P%d: diameter %.3f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
-              back->smart_encoder.get_port(), back->wheel_diameter_get(),
-              back->ratio_get(), back_tpi, back->distance_to_center_get(),
-              back->distance_to_center_flip_get(), static_cast<long>(back->smart_encoder.get_reversed()));
-  std::printf("RIGHT P%d: diameter %.3f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
-              right->smart_encoder.get_port(), right->wheel_diameter_get(),
-              right->ratio_get(), right_tpi, right->distance_to_center_get(),
-              right->distance_to_center_flip_get(), static_cast<long>(right->smart_encoder.get_reversed()));
+  std::printf("FRONT P%d: diameter %.4f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
+              front->smart_encoder.get_port(), front->wheel_diameter_get(),
+              front->ratio_get(), front_tpi, front->distance_to_center_get(),
+              front->distance_to_center_flip_get(), static_cast<long>(front->smart_encoder.get_reversed()));
+  std::printf("LEFT P%d: diameter %.4f ratio %.3f ticks/in %.6f offset %+.4f flip %d reversed %ld\n",
+              left->smart_encoder.get_port(), left->wheel_diameter_get(),
+              left->ratio_get(), left_tpi, left->distance_to_center_get(),
+              left->distance_to_center_flip_get(), static_cast<long>(left->smart_encoder.get_reversed()));
   std::printf("Start: X %.3f in | Y %.3f in | THETA %.3f deg\n",
               start.x, start.y, start.theta);
 
+  // Arming is specific to this diagnostic. The existing motor owner checks it
+  // even if this task blocks in pid_wait(), its logging, or a sensor call.
+  ez::drive_stop(&chassis);
+  if (!ez::geometry_turn_deadline_arm(&chassis)) {
+    pros::lcd::set_text(6,"STOPPED: cannot arm turn");
+    std::printf("GEOMETRY TURN NOT STARTED: disabled/cancelled or deadline already active.\n");
+    return;
+  }
+  const auto motion_started = pros::millis();
   chassis.pid_turn_set(90_deg, 40, ez::raw);
   chassis.pid_wait();
-  // drive_set disables the motion PID in EZ 3.2.2. Keep odometry running
-  // through settling, then capture the actual pose without resetting it.
-  chassis.drive_set(0, 0);
+  // Serialize the final zero with the motor owner, then disarm. Never clear a
+  // deadline before stopping; timeout remains latched in the reported result.
+  ez::drive_stop(&chassis);
+  const auto deadline_result = ez::geometry_turn_deadline_result();
+  const auto motion_elapsed = pros::millis() - motion_started;
+  const char* stop_reason = deadline_result == geometry_turn::Result::Timeout ? "TIMEOUT" :
+      deadline_result == geometry_turn::Result::Interrupted ? "INTERRUPTED" :
+      chassis.interfered ? "NATIVE FAILURE" : "WAIT RETURNED";
   pros::delay(250);
   const auto final_pose = chassis.odom_pose_get();
-  const double back_raw_end = back->smart_encoder.get_position();
-  const double right_raw_end = right->smart_encoder.get_position();
+  const double front_raw_end = front->smart_encoder.get_position();
+  const double left_raw_end = left->smart_encoder.get_position();
   const double imu_end = chassis.drive_imu_get();
-  const double heading_delta_rad = ez::util::to_rad(imu_end - imu_start);
-  const double back_inches = (back_raw_end - back_raw_start) / back_tpi;
-  const double right_inches = (right_raw_end - right_raw_start) / right_tpi;
+  const bool front_valid = front->smart_encoder.is_installed() && valid_sample(front_raw_end);
+  const bool left_valid = left->smart_encoder.is_installed() && valid_sample(left_raw_end);
+  const bool imu_valid = valid_sample(imu_end);
+  const double heading_delta_rad = imu_valid ? ez::util::to_rad(imu_end - imu_start) : NAN;
+  const double front_inches = front_valid ? (front_raw_end - front_raw_start) / front_tpi : NAN;
+  const double left_inches = left_valid ? (left_raw_end - left_raw_start) / left_tpi : NAN;
   // EZ uses internal angle = -IMU. A positive-heading pure turn needs
-  // BACK travel = +back_offset * angle, RIGHT travel = -right_offset * angle.
-  const double back_expected = back->distance_to_center_get() * heading_delta_rad;
-  const double right_expected = -right->distance_to_center_get() * heading_delta_rad;
+  // FRONT travel = +front_offset * angle, LEFT travel = -left_offset * angle.
+  // distance_to_center_get() is signed: FRONT +1.400, LEFT -0.800.
+  // Thus both expected travels are positive for clockwise rotation.
+  const double front_expected = front->distance_to_center_get() * heading_delta_rad;
+  const double left_expected = -left->distance_to_center_get() * heading_delta_rad;
   const double x_drift = final_pose.x - start.x;
   const double y_drift = final_pose.y - start.y;
+  std::printf("GEOMETRY TURN STOP: %s; wait/stop elapsed=%lu ms; cutoff=%lu ms; zero command issued, physical rest unverified.\n",
+              stop_reason,static_cast<unsigned long>(motion_elapsed),
+              static_cast<unsigned long>(geometry_turn::maximum_powered_ms));
+  std::printf("END SENSOR VALIDITY: P5 FRONT=%d P7 LEFT=%d IMU=%d; invalid travel/expectation shown as nan.\n",
+              front_valid,left_valid,imu_valid);
 
   pros::lcd::print(1, "X: %.3f in", final_pose.x);
   pros::lcd::print(2, "Y: %.3f in", final_pose.y);
   pros::lcd::print(3, "THETA: %.3f deg", final_pose.theta);
   pros::lcd::print(4, "X DRIFT: %.3f in", x_drift);
   pros::lcd::print(5, "Y DRIFT: %.3f in", y_drift);
-  pros::lcd::print(6, "B cd: %.0f -> %.0f", back_raw_start, back_raw_end);
-  pros::lcd::print(7, "R cd: %.0f -> %.0f", right_raw_start, right_raw_end);
-  std::printf("BACK raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
-              back_raw_start, back_raw_end, back_raw_end - back_raw_start, back_inches, back_expected);
-  std::printf("RIGHT raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
-              right_raw_start, right_raw_end, right_raw_end - right_raw_start, right_inches, right_expected);
+  pros::lcd::print(6, "F cd: %.0f -> %.0f", front_raw_start, front_raw_end);
+  pros::lcd::print(7, "L cd: %.0f -> %.0f", left_raw_start, left_raw_end);
+  std::printf("FRONT raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
+              front_raw_start, front_raw_end, front_raw_end - front_raw_start, front_inches, front_expected);
+  std::printf("LEFT raw cd: %.0f -> %.0f | delta %+.0f | travel %+.5f in | expected %+.5f in\n",
+              left_raw_start, left_raw_end, left_raw_end - left_raw_start, left_inches, left_expected);
   std::printf("IMU: %.5f -> %.5f deg | unwrapped delta %.6f rad\n", imu_start, imu_end, heading_delta_rad);
   if (std::fabs(heading_delta_rad) > 0.01) {
-    std::printf("Signed pure-turn radii: BACK %+.5f in | RIGHT %+.5f in (NOT APPLIED)\n",
-                back_inches / heading_delta_rad, -right_inches / heading_delta_rad);
+    std::printf("Signed pure-turn radii: FRONT %+.5f in | LEFT %+.5f in (NOT APPLIED)\n",
+                front_inches / heading_delta_rad, -left_inches / heading_delta_rad);
   }
   std::printf("Final: X %.3f in | Y %.3f in | THETA %.3f deg\n",
               final_pose.x, final_pose.y, final_pose.theta);
@@ -366,23 +406,23 @@ void odom_geometry_turn_90_test() {
   pages[0][3] = text_value("THETA: %.3f deg", final_pose.theta);
   pages[0][4] = text_value("X DRIFT: %+.3f in", x_drift);
   pages[0][5] = text_value("Y DRIFT: %+.3f in", y_drift);
-  pages[0][6] = "90 deg / speed 40";
+  pages[0][6] = front_valid && left_valid && imu_valid ? stop_reason : "INVALID SENSOR: see raw";
 
-  pages[1][0] = "2/8 BACK RAW";
-  pages[1][1] = text_value("BEFORE: %+.0f cd", back_raw_start);
-  pages[1][2] = text_value("AFTER:  %+.0f cd", back_raw_end);
-  pages[1][3] = text_value("DELTA:  %+.0f cd", back_raw_end - back_raw_start);
-  pages[1][4] = text_value("TRAVEL: %+.5f in", back_inches);
-  pages[1][5] = text_value("EXPECT: %+.5f in", back_expected);
-  pages[1][6] = "cd = 1/100 degree";
+  pages[1][0] = "2/8 FRONT RAW";
+  pages[1][1] = text_value("BEFORE: %+.0f cd", front_raw_start);
+  pages[1][2] = text_value("AFTER:  %+.0f cd", front_raw_end);
+  pages[1][3] = text_value("DELTA:  %+.0f cd", front_raw_end - front_raw_start);
+  pages[1][4] = text_value("TRAVEL: %+.5f in", front_inches);
+  pages[1][5] = text_value("EXPECT: %+.5f in", front_expected);
+  pages[1][6] = front_valid ? "P5 VALID | cd=1/100 deg" : "P5 INVALID / DISCONNECTED";
 
-  pages[2][0] = "3/8 RIGHT RAW";
-  pages[2][1] = text_value("BEFORE: %+.0f cd", right_raw_start);
-  pages[2][2] = text_value("AFTER:  %+.0f cd", right_raw_end);
-  pages[2][3] = text_value("DELTA:  %+.0f cd", right_raw_end - right_raw_start);
-  pages[2][4] = text_value("TRAVEL: %+.5f in", right_inches);
-  pages[2][5] = text_value("EXPECT: %+.5f in", right_expected);
-  pages[2][6] = "36000 cd = 1 rev";
+  pages[2][0] = "3/8 LEFT RAW";
+  pages[2][1] = text_value("BEFORE: %+.0f cd", left_raw_start);
+  pages[2][2] = text_value("AFTER:  %+.0f cd", left_raw_end);
+  pages[2][3] = text_value("DELTA:  %+.0f cd", left_raw_end - left_raw_start);
+  pages[2][4] = text_value("TRAVEL: %+.5f in", left_inches);
+  pages[2][5] = text_value("EXPECT: %+.5f in", left_expected);
+  pages[2][6] = left_valid ? "P7 VALID | 36000 cd/rev" : "P7 INVALID / DISCONNECTED";
 
   pages[3][0] = "4/8 IMU HEADING";
   pages[3][1] = text_value("BEFORE: %.4f deg", imu_start);
@@ -390,37 +430,37 @@ void odom_geometry_turn_90_test() {
   pages[3][3] = text_value("CHANGE: %+.4f deg", imu_end - imu_start);
   pages[3][4] = text_value("CHANGE: %+.6f rad", heading_delta_rad);
   pages[3][5] = "Unwrapped EZ IMU";
-  pages[3][6] = "Saved after settling";
+  pages[3][6] = imu_valid ? "Saved after settling" : "INVALID IMU READING";
 
-  pages[4][0] = "5/8 BACK CONFIG";
-  pages[4][1] = text_value("PORT: %.0f / BACK", back->smart_encoder.get_port());
-  pages[4][2] = text_value("OFFSET: %+.4f in", back->distance_to_center_get());
-  pages[4][3] = text_value("REVERSED: %.0f", back->smart_encoder.get_reversed());
-  pages[4][4] = text_value("OFFSET FLIP: %.0f", back->distance_to_center_flip_get());
+  pages[4][0] = "5/8 FRONT CONFIG";
+  pages[4][1] = text_value("PORT: %.0f / FRONT", front->smart_encoder.get_port());
+  pages[4][2] = text_value("OFFSET: %+.4f in", front->distance_to_center_get());
+  pages[4][3] = text_value("REVERSED: %.0f", front->smart_encoder.get_reversed());
+  pages[4][4] = text_value("OFFSET FLIP: %.0f", front->distance_to_center_flip_get());
   pages[4][5] = "0 = NO / 1 = YES";
   pages[4][6] = "Flags, not direction proof";
 
-  pages[5][0] = "6/8 RIGHT CONFIG";
-  pages[5][1] = text_value("PORT: %.0f / RIGHT", right->smart_encoder.get_port());
-  pages[5][2] = text_value("OFFSET: %+.4f in", right->distance_to_center_get());
-  pages[5][3] = text_value("REVERSED: %.0f", right->smart_encoder.get_reversed());
-  pages[5][4] = text_value("OFFSET FLIP: %.0f", right->distance_to_center_flip_get());
+  pages[5][0] = "6/8 LEFT CONFIG";
+  pages[5][1] = text_value("PORT: %.0f / LEFT", left->smart_encoder.get_port());
+  pages[5][2] = text_value("OFFSET: %+.4f in", left->distance_to_center_get());
+  pages[5][3] = text_value("REVERSED: %.0f", left->smart_encoder.get_reversed());
+  pages[5][4] = text_value("OFFSET FLIP: %.0f", left->distance_to_center_flip_get());
   pages[5][5] = "0 = NO / 1 = YES";
   pages[5][6] = "Flags, not direction proof";
 
-  pages[6][0] = "7/8 BACK SCALE";
-  pages[6][1] = text_value("DIAMETER: %.4f in", back->wheel_diameter_get());
-  pages[6][2] = text_value("GEAR RATIO: %.4f", back->ratio_get());
-  pages[6][3] = text_value("TICKS/REV: %.0f", back->ticks_per_rev_get());
-  pages[6][4] = text_value("TICKS/IN: %.4f", back_tpi);
+  pages[6][0] = "7/8 FRONT SCALE";
+  pages[6][1] = text_value("DIAMETER: %.4f in", front->wheel_diameter_get());
+  pages[6][2] = text_value("GEAR RATIO: %.4f", front->ratio_get());
+  pages[6][3] = text_value("TICKS/REV: %.0f", front->ticks_per_rev_get());
+  pages[6][4] = text_value("TICKS/IN: %.4f", front_tpi);
   pages[6][5] = "Raw = sensor position";
   pages[6][6] = "Snapshot: no live updates";
 
-  pages[7][0] = "8/8 RIGHT SCALE";
-  pages[7][1] = text_value("DIAMETER: %.4f in", right->wheel_diameter_get());
-  pages[7][2] = text_value("GEAR RATIO: %.4f", right->ratio_get());
-  pages[7][3] = text_value("TICKS/REV: %.0f", right->ticks_per_rev_get());
-  pages[7][4] = text_value("TICKS/IN: %.4f", right_tpi);
+  pages[7][0] = "8/8 LEFT SCALE";
+  pages[7][1] = text_value("DIAMETER: %.4f in", left->wheel_diameter_get());
+  pages[7][2] = text_value("GEAR RATIO: %.4f", left->ratio_get());
+  pages[7][3] = text_value("TICKS/REV: %.0f", left->ticks_per_rev_get());
+  pages[7][4] = text_value("TICKS/IN: %.4f", left_tpi);
   pages[7][5] = text_value("STDOUT FLUSH: %.0f", terminal_flush_status);
   pages[7][6] = text_value("STDOUT ERROR: %.0f", terminal_error_flag);
   page = 0;

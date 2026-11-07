@@ -7,7 +7,6 @@
 
 namespace auton_actions {
 inline constexpr bool ENABLE_AUTON_TELEMETRY = false;
-inline constexpr bool ENABLE_ADVANCED_PATHS = false;
 inline constexpr bool ENABLE_MECHANISM_ACTIONS = false;
 inline constexpr bool ENABLE_DISTANCE_CORRECTION = false;
 

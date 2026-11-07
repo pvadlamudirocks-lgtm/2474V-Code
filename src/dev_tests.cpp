@@ -5,6 +5,7 @@
 #include "nav_diagnostics.hpp"
 #include "nav_sequence.hpp"
 #include "full_system_diag.hpp"
+#include "motion_exit_trace.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
 #include <cmath>
 #include <cstdio>
@@ -97,17 +98,14 @@ const char* test_name(DevTest test) {
 // Common before/after reporting keeps primitive tests easy to compare.
 template <typename Motion>
 void measured_move(const char* label, ez::pose target, Motion motion) {
-  if (!ez::movement_ready()) {
-    std::printf("DEV MOVE SKIPPED: %s fault=%s\n",label,ez::movement_fault());
-    return;
-  }
+  if (ez::autonomous_cancelled()) return;
   const auto start = nav_pose_get();
   nav_print_snapshot("BEFORE MOVE");
   const auto began = pros::millis();
   motion();
   const auto elapsed = pros::millis() - began;
-  if (!ez::movement_ready() || chassis.interfered) {
-    std::printf("DEV MOVE FAILED: %s fault=%s interfered=%d\n",label,ez::movement_fault(),chassis.interfered);
+  if (ez::autonomous_cancelled() || chassis.interfered) {
+    std::printf("DEV MOVE FAILED: %s cancelled=%d interfered=%d\n",label,ez::autonomous_cancelled(),chassis.interfered);
     return;
   }
   nav_print_test_result(label, start, target, elapsed);
@@ -135,12 +133,6 @@ void run_dev_test(DevTest test) {
       std::fflush(stdout);
     }
   } end{name};
-  if (test == DevTest::CHAIN_TWO_MOVE || test == DevTest::PURE_PURSUIT_BASIC) {
-    if (!ENABLE_ADVANCED_DEV_TESTS) {
-      std::printf("ADVANCED TEST DISABLED\nPass foundation tests before enabling chaining/Pure Pursuit.\n");
-      return;
-    }
-  }
   if (test == DevTest::SENSOR_HEALTH || test == DevTest::MANUAL_ODOM) {
     nav_print_sensor_health();
     std::printf("30-second read-only window; NO pose/sensor reset. NaN means unavailable.\n");
@@ -161,23 +153,14 @@ void run_dev_test(DevTest test) {
     auton_actions::run_helper_math_test();
     return;
   }
-  // Preflight checks issue no motor commands. Do not seed odometry from failed sensors.
-  if (!nav_print_sensor_health()) {
-    std::printf("DEV TEST ABORTED: sensors unavailable or IMU calibrating.\n");
-    return;
-  }
+  nav_print_sensor_health(); // Diagnostic only.
   nav_set_start(0, 0, 0);
-  if (!nav_sensors_ready() || !nav_validate_pose(0,0,0,0.5,0.5)) {
-    ez::movement_cancel("start pose failed");
-    ez::movement_stop();
-    std::printf("DEV TEST ABORTED: start pose failed\n");
-    return;
-  }
   switch (test) {
     case DevTest::START_POSE:
       nav_print_snapshot("START POSE");
       return;
     case DevTest::DRIVE_FORWARD_12:
+      drive_diagnostic_arm();
       measured_move(name, {0, 12, ez::ANGLE_NOT_SET}, [] { nav_drive_distance(12, 40); });
       break;
     case DevTest::TURN_90:

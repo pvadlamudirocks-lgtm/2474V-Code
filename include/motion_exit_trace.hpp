@@ -1,4 +1,6 @@
 #pragma once
+// Explicit test-only DRIVE trace; ordinary pid_wait never stops for diagnostics.
+void drive_diagnostic_arm();
 #include "navigation.hpp"
 #include <utility>
 

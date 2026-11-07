@@ -6,6 +6,4 @@ enum class DevTest {
   SQUARE, GOTO_POSE, CHAIN_TWO_MOVE, PURE_PURSUIT_BASIC, MIRROR_MATH, STABILITY_MONITOR, FULL_SYSTEM_DIAG
 };
 
-// Enable only after physically verifying foundation tests.
-inline constexpr bool ENABLE_ADVANCED_DEV_TESTS = false;
 void run_dev_test(DevTest test);

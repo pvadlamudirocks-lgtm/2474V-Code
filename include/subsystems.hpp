@@ -1,13 +1,16 @@
+
 #pragma once
 #include "api.h"
+#include "lift_calibration.hpp"
 
 // All wiring and calibration choices live here. Validation is documented per item.
 namespace mechanism_config {
 // ----- Wiring and physical directions -----
 // Change assignments here after checking the robot, rather than in route functions.
 // Legacy distance_correction.cpp is excluded; its P11/P12 placeholders are obsolete.
-constexpr int LEFT_LIFT_PORT = 14; // Left lift motor: green cartridge, 200 RPM.
-constexpr int RIGHT_LIFT_PORT = 15; // Right lift motor: green cartridge, 200 RPM.
+constexpr int LEFT_LIFT_PORT = 14;
+constexpr int RIGHT_LIFT_PORT = 15;
+constexpr int THIRD_LIFT_PORT = 13;
 constexpr int LIFT_ROTATION_PORT = 16;
 // Green cartridges use 18:1 internal gearing, 200 RPM.
 // Confirmed external gearing is 1:1: one output revolution per motor revolution.
@@ -35,7 +38,7 @@ constexpr double LIFT_HEIGHT_DISTANCE_MIN_MM = __builtin_nan("");
 constexpr double LIFT_HEIGHT_DISTANCE_MAX_MM = __builtin_nan("");
 // New claw-area hardware: 0 is UNBOUND, never passed to a device constructor.
 constexpr bool CLAW_PNEUMATIC_CONFIGURED = true;
-constexpr int CLAW_PNEUMATIC_PORT = 'A'; // Verified claw solenoid; polarity not yet verified.
+constexpr int CLAW_PNEUMATIC_PORT = 'H'; // Verified claw solenoid; polarity not yet verified.
 constexpr bool FLEX_CONFIGURED = true;
 constexpr int FLEX_LEFT_PORT = 11;  // Claw flex motor moved from port 8.
 constexpr int FLEX_RIGHT_PORT = 12; // Claw flex motor moved from port 10.
@@ -68,10 +71,12 @@ constexpr unsigned LIFT_RETURN_TIMEOUT_MS = 0;
 constexpr bool CLAW_OPEN_OUTPUT = false; // User-tested mapping: OFF opens, ON closes; retest after change.
 constexpr bool FLIP_REVERSE_OUTPUT = true; // false output should be normal.
 // Driver confirmed UP with port14 positive / port15 negative in the raw test.
+
 constexpr bool LEFT_LIFT_REVERSED = false;
 constexpr bool RIGHT_LIFT_REVERSED = true;
+constexpr bool THIRD_LIFT_REVERSED = true;
 constexpr bool ARM_MOTOR_REVERSED = false;
-constexpr bool LIFT_ROTATION_REVERSED = false;
+constexpr bool LIFT_ROTATION_REVERSED = true;
 constexpr bool ARM_ROTATION_REVERSED = false;
 // Confirmed: sensor is on the actual lift/output axle. Only centidegrees ->
 // degrees conversion applies; no extra motor-to-output scaling at 1:1.
@@ -81,6 +86,23 @@ constexpr double ARM_SENSOR_DEG_PER_MECHANISM_DEG = 1.0; // TODO VERIFY coupling
 // ----- Calibration and enable switches -----
 // These gates separate supported manual tests from unqualified automatic movement.
 // Commissioning gates. Enable manual tests with mechanisms physically supported.
+
+constexpr bool ENABLE_LIFT_STARTUP_ZERO = true;
+
+// Temporary calibration mode: continuous L1/L2 control.
+// Use only in standalone driver mode without competition control.
+constexpr bool ENABLE_LIFT_CALIBRATION_MODE = false;
+
+// Maximum duration of one continuous button hold.
+constexpr unsigned LIFT_CALIBRATION_MAX_HOLD_MS = 10000;
+
+// Stop calibration if P16 does not respond to movement.
+constexpr unsigned LIFT_CALIBRATION_MOTION_CHECK_MS = 1200;
+constexpr double LIFT_CALIBRATION_MIN_MOTION_DEG = 0.5;
+
+// Block L2 near zero in both calibration and normal operation.
+constexpr double LIFT_LOWER_STOP_MARGIN_DEG = 2.0;
+
 constexpr bool ENABLE_LIFT_MANUAL = true;
 constexpr bool ENABLE_ARM_MANUAL = false;
 // Enable only after lift calibration and automatic movement are validated.
@@ -89,15 +111,23 @@ constexpr unsigned LIFT_HOME_REQUIRED_PRESSES = 6;
 constexpr unsigned LIFT_HOME_SWITCH_DEBOUNCE_MS = 30;
 constexpr unsigned LIFT_HOME_PRESS_SEQUENCE_TIMEOUT_MS = 10000;
 // Enable feedback ONLY after positive motor output increases sensor position.
-constexpr bool LIFT_FEEDBACK_VERIFIED = false;
+constexpr bool LIFT_FEEDBACK_VERIFIED = true;
 constexpr bool ARM_FEEDBACK_VERIFIED = false;
 constexpr bool ENABLE_PNEUMATICS = false;
 
 // TODO PHYSICAL CALIBRATION REQUIRED. Zero maxima disable automatic movement.
-constexpr bool LIFT_LIMITS_CALIBRATED = false;
+
+// Only enable after physically verifying the home position,
+// P16 direction, upper limit, and stopping distance.
+constexpr bool LIFT_LIMITS_PHYSICALLY_VERIFIED = true;
+
+constexpr bool LIFT_LIMITS_CALIBRATED =
+    LIFT_LIMITS_PHYSICALLY_VERIFIED &&
+    (lift_calibration::MAX_SAFE_DEG > 0.0);
 constexpr bool ARM_LIMITS_CALIBRATED = false;
 constexpr double LIFT_MIN_DEG = 0.0;
-constexpr double LIFT_MAX_DEG = 0.0; // NOT VALIDATED: replace with safe maximum.
+constexpr double LIFT_MAX_DEG =
+    lift_calibration::MAX_SAFE_DEG;
 constexpr double ARM_MIN_DEG = 0.0;
 constexpr double ARM_MAX_DEG = 0.0;  // NOT VALIDATED: replace with safe maximum.
 constexpr double LIFT_HOME_DEG = 0.0;
@@ -119,7 +149,7 @@ constexpr double ARM_HOLD_KP = 60.0;
 constexpr double ARM_HOLD_KD = 0.0;
 constexpr int LIFT_MANUAL_MV = 1500; // Keep low for the lift direction test; external gearing is 1:1.
 constexpr int ARM_MANUAL_MV = 1500;
-constexpr int LIFT_CLOSED_LOOP_MAX_MV = 2000;
+constexpr int LIFT_CLOSED_LOOP_MAX_MV = 12000;
 constexpr int ARM_CLOSED_LOOP_MAX_MV = 2000;
 constexpr double LIFT_TARGET_TOLERANCE_DEG = 2.0; // TODO TUNE.
 constexpr double ARM_TARGET_TOLERANCE_DEG = 2.0;  // TODO TUNE.
@@ -127,19 +157,21 @@ constexpr unsigned UPDATE_PERIOD_MS = 10;
 constexpr unsigned MANUAL_COMMAND_TIMEOUT_MS = 100;
 constexpr unsigned MAX_UPDATE_GAP_MS = 100;
 constexpr unsigned TARGET_SETTLE_MS = 200;
-constexpr unsigned TARGET_TIMEOUT_MS = 5000; // TODO VERIFY real travel time.
+constexpr unsigned TARGET_TIMEOUT_MS = 10000; // TODO VERIFY real travel time.
 constexpr unsigned DEBUG_PERIOD_MS = 500;
 
 constexpr bool ENABLE_CLAW_DISTANCE_AUTO_ARM = false;
 constexpr bool CLAW_DISTANCE_CALIBRATED = false;
-constexpr int CLAW_DETECT_MIN_MM = 0; // TODO CALIBRATE; invalid window by default.
+constexpr int CLAW_DETECT_MIN_MM = 0;
 constexpr int CLAW_DETECT_MAX_MM = 0;
-constexpr int CLAW_DETECT_MIN_CONFIDENCE = 20; // TODO VALIDATE.
-constexpr unsigned CLAW_DETECT_CONSISTENT_READINGS = 3; // TODO VALIDATE.
+constexpr int CLAW_DETECT_MIN_CONFIDENCE = 20;
+constexpr unsigned CLAW_DETECT_CONSISTENT_READINGS = 3;
 constexpr unsigned CLAW_DISTANCE_SAMPLE_MS = 20;
 constexpr int DISTANCE_CONFIDENCE_AVAILABLE_ABOVE_MM = 200; // Installed PROS API.
 }
 
+
+enum class LiftFinish { STOP, HOLD_CURRENT_TARGET };
 enum class LiftMode { Disabled, Manual, Hold, MoveToTarget, Fault, ReturningHome,
                       DriverFull, AutonFull };
 enum class ArmMode { Disabled, Manual, Hold, MoveToTarget, Fault };
@@ -165,6 +197,16 @@ void arm_cancel_auto();
 // Nonblocking. false = rejected; existing command is unchanged.
 // Targets require home, verified feedback, valid limits and no manual command.
 bool lift_set_target(double position_deg);
+
+bool lift_move_preset(lift_calibration::Position preset);
+
+
+bool lift_auton_to_preset(
+    lift_calibration::Position preset,
+    unsigned timeout_ms,
+    LiftFinish finish = LiftFinish::STOP
+);
+
 bool lift_move_home();
 bool lift_move_low();
 bool lift_move_mid();
@@ -192,7 +234,6 @@ bool lift_auton_stop(); // Always attempts zero on BOTH motors, even while disab
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms);
 // STOP removes motor output on success; HOLD keeps the same target under sensor control.
 // HOLD requires validation and continued mechanism updates after this blocking call.
-enum class LiftFinish { STOP, HOLD_CURRENT_TARGET };
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms, LiftFinish finish);
 bool lift_target_ready();
 // Select a configured HOME/CLEARANCE/SCORE/MAX_SAFE entry from lift_calibration.hpp.
@@ -255,11 +296,11 @@ bool flex_intake(int power = mechanism_config::FLEX_INTAKE_POWER);
 bool flex_outtake(int power = mechanism_config::FLEX_OUTTAKE_POWER);
 bool flex_stop();
 bool toggle_run();
-bool toggle_run_reverse(); // Opposite the configured normal direction; shared hardware.
+bool toggle_run_reverse();
 bool toggle_stop();
 bool claw_grab(int power = mechanism_config::FLEX_INTAKE_POWER); // Close + intake.
 bool claw_score(int power = mechanism_config::FLEX_OUTTAKE_POWER); // Open + outtake.
-// Driver: R1 held = intake(127), released = intake(13); R2 = same claw toggle + flex stop.
+// Driver: R2 held = intake(127), released = intake(13); R1 = same claw toggle + flex stop.
 void claw_driver_control(bool flex_held, bool claw_new_press);
 // Combined actions require a chosen power 1..127; uncommissioned default 0
 // rejects safely rather than claiming to collect with stationary wheels.

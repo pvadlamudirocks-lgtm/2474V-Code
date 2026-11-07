@@ -8,14 +8,6 @@
 #include <cstdio>
 
 namespace {
-template <typename Command>
-bool dispatch_motion(Command command) {
-  if (!ez::navigation_try_lock(10)) { ez::movement_cancel("navigation lock timeout"); return false; }
-  const bool ready=ez::movement_ready();
-  if(ready) command();
-  ez::navigation_unlock();
-  return ready;
-}
 double wrap_heading(double degrees) {
   const double wrapped = std::fmod(degrees, 360.0);
   return wrapped < 0.0 ? wrapped + 360.0 : wrapped;
@@ -65,9 +57,9 @@ double nav_theta_get() {
 
 void nav_set_start(double x_in, double y_in, double theta_deg) {
   nav_print_snapshot("BEFORE nav_set_start");
-  if (!nav_sensors_ready() || !std::isfinite(x_in) || !std::isfinite(y_in) ||
+  if (!std::isfinite(x_in) || !std::isfinite(y_in) ||
       !std::isfinite(theta_deg)) {
-    std::printf("START RESET REJECTED: sensor fault or invalid requested pose\n");
+    std::printf("START RESET REJECTED: invalid requested pose\n");
     return;
   }
   // Set the software reference after physically aligning the robot at the start.
@@ -96,16 +88,14 @@ void nav_set_start(double x_in, double y_in, double theta_deg) {
 // Send the requested movement to EZ and wait for its exit conditions.
 // Returning from a wait alone does not prove that the physical target was reached.
 void nav_go_to(double x_in, double y_in, int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
   const ez::odom movement{nav_game_to_internal_pose({x_in, y_in}), ez::fwd, speed};
   motion_exit_trace_begin(movement);
-  if(!dispatch_motion([&]{chassis.pid_odom_set(movement);})) return;
+  chassis.pid_odom_set(movement);
   chassis.pid_wait();
   motion_exit_trace_finish();  // No-op unless separately armed.
 }
 
 void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
   const auto target = nav_game_to_internal_pose({x_in, y_in, public_heading_deg});
   const ez::odom movement{target, ez::fwd, speed};  // FRONT-first, as in nav_go_to.
   const bool interfered_before = chassis.interfered;
@@ -115,7 +105,7 @@ void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int spe
   std::fflush(stdout);
   pose_exit_trace_begin();
   // Explicit single-pose API; uses the existing global slew/Boomerang settings.
-  if(!dispatch_motion([&]{chassis.pid_odom_boomerang_set(movement);})) return;
+  chassis.pid_odom_boomerang_set(movement);
   chassis.pid_wait();
   const auto final_pose = nav_pose_get();
   const auto exits = pose_exit_trace_finish();
@@ -132,33 +122,29 @@ void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int spe
 }
 
 void nav_go_to_reverse(double x_in, double y_in, int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
-  if(!dispatch_motion([&]{chassis.pid_odom_set({nav_game_to_internal_pose({x_in, y_in}), ez::rev, speed});})) return;
+  chassis.pid_odom_set({nav_game_to_internal_pose({x_in, y_in}), ez::rev, speed});
   chassis.pid_wait();
 }
 
 void nav_go_to_pose_reverse(double x_in, double y_in, double theta_deg,
                             int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
-  if(!dispatch_motion([&]{chassis.pid_odom_set(
-      {nav_game_to_internal_pose({x_in, y_in, theta_deg}), ez::rev, speed});})) return;
+  chassis.pid_odom_set(
+      {nav_game_to_internal_pose({x_in, y_in, theta_deg}), ez::rev, speed});
   chassis.pid_wait();
 }
 
 void nav_turn_to(double theta_deg, int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
   turn_velocity_trace_begin();
   const double target = nav_game_to_internal_heading(theta_deg);
   final_turn_trace_target(target);
-  if(!dispatch_motion([&]{chassis.pid_turn_set(target, speed);})) return;
+  chassis.pid_turn_set(target, speed);
   chassis.pid_wait();
   final_turn_trace_wait_returned();
 }
 
 void nav_drive_distance(double inches, int speed) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return; }
   // Positive distance moves FRONT-first in the native chassis frame.
-  if(!dispatch_motion([&]{chassis.pid_drive_set(inches, speed);})) return;
+  chassis.pid_drive_set(inches, speed);
   chassis.pid_wait();
 }
 
@@ -166,7 +152,6 @@ namespace {
 bool follow_path(const std::vector<nav_waypoint>& waypoints, int speed,
                  nav_path_direction direction, bool use_final_heading,
                  double final_public_heading) {
-  if (!ez::movement_ready() || !nav_sensors_ready()) { chassis.interfered = true; return false; }
   // Build one native path from the whole point list, rather than stopping at each point.
   if (waypoints.empty() || speed < 1 || speed > 127 ||
       (direction != nav_path_direction::forward &&
@@ -194,10 +179,10 @@ bool follow_path(const std::vector<nav_waypoint>& waypoints, int speed,
   // Native injection + lookahead following; no custom path algorithm, per-point
   // waits, tuning changes, or post-path turn. Global slew settings are retained.
   path_motion_trace_begin(movements);  // No-op unless explicitly armed.
-  if(!dispatch_motion([&]{chassis.pid_odom_injected_pp_set(movements);})) return false;
+  chassis.pid_odom_injected_pp_set(movements);
   chassis.pid_wait();  // Retains the project's existing final-waypoint wait fix.
   path_motion_trace_wait_returned();   // Capture only; never stops or prints.
-  return ez::movement_ready() && !chassis.interfered;
+  return !ez::autonomous_cancelled() && !chassis.interfered;
 }
 }  // namespace
 

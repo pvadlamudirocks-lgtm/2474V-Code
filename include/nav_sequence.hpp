@@ -3,7 +3,8 @@
 #include <functional>
 
 // Use only from the autonomous task. No nested scopes or raw chassis commands.
-// Destructor finishes a pending chain and stops on all normal C++ return paths.
+// Destructor finishes a pending chain and stops on normal C++ return paths.
+// Legacy timeout argument is retained for source compatibility, not enforced.
 class NavSequence {
  public:
   explicit NavSequence(bool trace = false, unsigned motion_timeout_ms = 8000);

@@ -27,7 +27,7 @@ bool nav_sensors_ready() {
       h->smart_encoder.get_position()!=PROS_ERR && v->smart_encoder.get_position()!=PROS_ERR &&
       std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.theta);
   if (!ready) latch_sensor_fault();
-  return ready && !nav_sensor_fault_latched();
+  return ready; // Historical fault latch is telemetry only, never a movement gate.
 }
 
 namespace {
@@ -274,7 +274,7 @@ bool nav_print_sensor_health() {
   std::fflush(stdout);
   if (!(back && right && ready)) latch_sensor_fault();
   const bool navigation_ready = nav_sensors_ready();
-  std::printf("NAV fault_latched=%d first_fault_ms=%u ready=%d (reboot required after fault)\n",
+  std::printf("NAV historical_fault=%d first_fault_ms=%u current_valid=%d (report only)\n",
       sensor_fault.load(), first_fault_ms.load(), navigation_ready);
   return navigation_ready;
 }

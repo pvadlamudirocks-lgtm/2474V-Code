@@ -1,5 +1,6 @@
 #include "path_motion_trace.hpp"
 #include "EZ-Template/path_trace_hook.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -403,15 +404,13 @@ void dump() {
 bool path_motion_trace_stop_and_dump() {
   if (!ready || !wait_seen) return false;
   // Explicit diagnostic harness boundary only; the navigation API never stops PID.
-  chassis.drive_set(0, 0);
+  ez::drive_stop(&chassis);
   stopped_ms = pros::millis() - began;
   capturing.store(false);
   ez::path_trace_hook_set(nullptr);
   trace_mutex.take();  // Drain any in-flight callback before reading its buffer.
   trace_mutex.give();
-  // Let an in-flight native tick finish, then assert the harness stop once more.
-  pros::delay(20);
-  chassis.drive_set(0, 0);
+  // The serialized stop already excludes an in-flight native controller tick.
   unsigned stable_ms = 0;
   const auto coast_start = pros::millis();
   while (pros::millis() - coast_start < 3000) {

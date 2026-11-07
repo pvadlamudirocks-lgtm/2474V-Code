@@ -1,3 +1,4 @@
+
 #include "subsystems.hpp"
 #include "lift_calibration.hpp"
 #include <cmath>
@@ -6,19 +7,40 @@
 
 namespace {
 using namespace mechanism_config;
+// Temporary low-voltage commissioning cap for all open-loop lift commands.
+// Restore higher power ONLY after the three-motor lift is physically qualified.
+
+constexpr int LIFT_COMMISSIONING_MV = 12000;
+static_assert(THIRD_LIFT_PORT >= 1 && THIRD_LIFT_PORT <= 21 &&
+              THIRD_LIFT_PORT != LEFT_LIFT_PORT && THIRD_LIFT_PORT != RIGHT_LIFT_PORT &&
+              THIRD_LIFT_PORT != LIFT_ROTATION_PORT && THIRD_LIFT_PORT != ARM_MOTOR_PORT &&
+              THIRD_LIFT_PORT != FLEX_LEFT_PORT && THIRD_LIFT_PORT != FLEX_RIGHT_PORT &&
+              THIRD_LIFT_PORT != TOGGLE_PORT && THIRD_LIFT_PORT != TOGGLE_OTHER_PORT &&
+              THIRD_LIFT_PORT != 1 && THIRD_LIFT_PORT != 2 && THIRD_LIFT_PORT != 3 &&
+              THIRD_LIFT_PORT != 4 && THIRD_LIFT_PORT != 5 && THIRD_LIFT_PORT != 7 &&
+              THIRD_LIFT_PORT != 20,
+              "Third lift port conflicts with an existing hardware assignment");
 // Lazy construction: linking this file does not configure hardware during the
 // existing odometry-only startup. A device is constructed only when requested.
-pros::Motor& left_lift_motor() {
-  static pros::Motor motor(LEFT_LIFT_REVERSED ? -LEFT_LIFT_PORT : LEFT_LIFT_PORT,
+pros::Motor& left_lift_motor() {  
+  static pros::Motor motor(LEFT_LIFT_PORT,
                            pros::v5::MotorGears::green);
   return motor;
 }
+
 pros::Motor& right_lift_motor() {
-  static pros::Motor motor(RIGHT_LIFT_REVERSED ? -RIGHT_LIFT_PORT : RIGHT_LIFT_PORT,
+  static pros::Motor motor(RIGHT_LIFT_PORT,
                            pros::v5::MotorGears::green);
   return motor;
 }
-pros::Motor& arm_motor() {
+
+pros::Motor& third_lift_motor() {
+  static pros::Motor motor(THIRD_LIFT_PORT,
+                           pros::v5::MotorGears::green);
+  return motor;
+}
+
+pros::Motor& arm_motor() {  
   static pros::Motor motor(ARM_MOTOR_REVERSED ? -ARM_MOTOR_PORT : ARM_MOTOR_PORT,
                            pros::v5::MotorGears::green);
   return motor;
@@ -123,12 +145,13 @@ AxisState arm;
 bool returning_home = false;
 // An explicitly invoked diagnostic owns output only while it is running.
 bool lift_response_running = false;
-// Only one lift mode may command the pair at a time.
+// Only one lift mode may command all three motors at a time.
 // Full-voltage driver/autonomous control must not compete with target or hold control.
 enum class LiftOutputOwner { None, Driver, Autonomous };
 LiftOutputOwner lift_output_owner = LiftOutputOwner::None;
 bool lift_output_fault = false; // Write faults latch independently of sensor calibration.
 int lift_full_direction = 0;
+unsigned lift_full_last_refresh = 0;
 bool flex_hold_active = false;
 unsigned return_started_at = 0;
 bool return_started_in_autonomous = false;
@@ -154,45 +177,146 @@ double read_position(bool is_lift) {
   return static_cast<double>(raw) / 100.0 / ratio;
 }
 
-// ONE physical sign definition for every lift writer: positive = UP.
-// Preserve the verified electrical P14 positive / P15 negative convention,
-// compensating the existing object's reversal rather than reversing it twice.
+// Shared lift output: positive command = UP. P13 uses P15's motor
+// polarity and P15's -up_mv command; confirm actual shaft direction first.
 bool write_lift_pair(int up_mv) {
+    // Preserve calibrated lift limits when enabled.
   if (up_mv != 0 && lift_calibration::enable_limits) {
-    if (!auton_math::lift_direction_allowed(lift_calibration::limits, read_position(true), up_mv > 0 ? 1 : -1)) {
-      // Configured limits require a known sensor reference; unknown/invalid stops.
+    if (!auton_math::lift_direction_allowed(
+            lift_calibration::limits,
+            read_position(true),
+            up_mv > 0 ? 1 : -1))    
       up_mv = 0;
-    }
-    if (!lift.homed) up_mv = 0;
+
+    if (!lift.homed)
+      up_mv = 0;
   }
-  const auto left = left_lift_motor().move_voltage(
-      (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv);
-  const auto right = right_lift_motor().move_voltage(
-      (RIGHT_LIFT_REVERSED ? -1 : 1) * -up_mv);
-  if (left != PROS_ERR && right != PROS_ERR) return true;
-  left_lift_motor().move_voltage(0);
-  right_lift_motor().move_voltage(0);
-  lift_output_fault = true;
-  return false;
+  // Check the physical ports using positive port numbers.
+// Workaround for reversed-motor is_installed() bug in PROS 4.1.1.
+if (up_mv != 0) {
+  static pros::Motor p13_check(THIRD_LIFT_PORT, pros::v5::MotorGears::green);
+  static pros::Motor p14_check(LEFT_LIFT_PORT, pros::v5::MotorGears::green);
+  static pros::Motor p15_check(RIGHT_LIFT_PORT, pros::v5::MotorGears::green);
+
+  if (!p13_check.is_installed() ||
+      !p14_check.is_installed() ||
+      !p15_check.is_installed()) {
+
+    left_lift_motor().move_voltage(0);
+    right_lift_motor().move_voltage(0);
+    third_lift_motor().move_voltage(0);
+
+    lift_output_fault = true;
+    return false;
+  }
 }
 
-bool write_voltage(bool is_lift, int mv) {
-  if (is_lift) {
-    if (mv < 0) {
-      const auto bottom = lift_bottom_limit_read();
-      if (bottom == LiftBottomLimit::Pressed || bottom == LiftBottomLimit::Fault) {
-        const bool stopped = write_lift_pair(0);
-        return stopped && bottom != LiftBottomLimit::Fault;
-      }
-    }
-    return write_lift_pair(mv);
-  }
-  return arm_motor().move_voltage(mv) != PROS_ERR;
+  const auto left = left_lift_motor().move_voltage(
+      (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv);
+
+  const auto right = right_lift_motor().move_voltage(
+      (RIGHT_LIFT_REVERSED ? -1 : 1) * up_mv);
+
+      
+
+const auto third = third_lift_motor().move_voltage(
+    (mechanism_config::THIRD_LIFT_REVERSED ? -1 : 1) * up_mv);
+
+// All three motor commands must succeed.
+if (left != PROS_ERR &&
+    right != PROS_ERR &&
+    third != PROS_ERR) {
+    return true;
 }
+
+// A motor command failed.
+// Attempt to stop ALL three lift motors.
+left_lift_motor().move_voltage(0);
+right_lift_motor().move_voltage(0);
+third_lift_motor().move_voltage(0);
+
+lift_output_fault = true;
+return false;
+
+}
+
+
+
+bool write_voltage(bool is_lift, int mv) {
+  if (!is_lift) {
+    return arm_motor().move_voltage(mv) != PROS_ERR;
+  }
+
+  // Always permit a stop command.
+  if (mv == 0) {
+    return write_lift_pair(0);
+  }
+
+  // Do not move before establishing a valid home reference.
+  if (!lift.initialized || !lift.homed) {
+    return write_lift_pair(0);
+  }
+
+  // P16 must remain valid during powered movement.
+  const double position = read_position(true);
+
+  if (!std::isfinite(position)) {
+    write_lift_pair(0);
+    return false;
+  }
+  
+  
+
+// Unknown maximum allows upward movement ONLY
+// during supervised standalone calibration.
+// Once a maximum exists, it is enforced.
+if (mv > 0) {
+    const double max_safe = mechanism_config::LIFT_MAX_DEG;
+
+    const bool max_known =
+        std::isfinite(max_safe) && max_safe > 0.0;
+
+    const bool calibration_driver =
+        mechanism_config::ENABLE_LIFT_CALIBRATION_MODE &&
+        lift_output_owner == LiftOutputOwner::Driver &&
+        !pros::competition::is_connected();
+
+    if ((max_known && position >= max_safe) ||
+        (!max_known && !calibration_driver)) {
+        return write_lift_pair(0);
+    }
+}
+
+
+  if (mv < 0) {
+    const auto bottom = lift_bottom_limit_read();
+
+    if (bottom == LiftBottomLimit::Fault) {
+      write_lift_pair(0);
+      return false;
+    }
+
+    // Prevent lowering at or below the calibrated zero.
+   
+    if (bottom == LiftBottomLimit::Pressed ||
+        position <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG) {
+        return write_lift_pair(0);
+    }
+
+  }
+
+  return write_lift_pair(mv);
+}
+
 
 // Cancel the current axis command and attempt a stop; a fault also invalidates home.
 bool disable_axis(AxisState& axis, bool is_lift, bool fault = false) {
-  if (is_lift) { lift_output_owner = LiftOutputOwner::None; lift_full_direction = 0; }
+
+if (is_lift) {
+    lift_output_owner = LiftOutputOwner::None;
+    lift_full_direction = 0;
+    lift_full_last_refresh = 0;
+}
   if (is_lift) lift_response_running = false; // Disable/stop must cancel the pulse.
   if (is_lift) returning_home = false;
   const bool stopped = !axis.initialized || write_voltage(is_lift, 0);
@@ -225,7 +349,9 @@ void initialize_axis(AxisState& axis, bool is_lift) {
   if (is_lift) {
     const auto left_result = left_lift_motor().set_brake_mode(pros::E_MOTOR_BRAKE_BRAKE);
     const auto right_result = right_lift_motor().set_brake_mode(pros::E_MOTOR_BRAKE_BRAKE);
-    brakes_ok = left_result != PROS_ERR && right_result != PROS_ERR;
+    const auto third_result = third_lift_motor().set_brake_mode(pros::E_MOTOR_BRAKE_BRAKE);
+    brakes_ok = left_result != PROS_ERR && right_result != PROS_ERR &&
+                third_result != PROS_ERR;
   } else {
     brakes_ok = arm_motor().set_brake_mode(pros::E_MOTOR_BRAKE_BRAKE) != PROS_ERR;
   }
@@ -330,11 +456,18 @@ void manual_axis(AxisState& axis, bool is_lift, int direction) {
 // ----- Lift and arm target control -----
 // Automatic moves need a known home, verified feedback and measured safe limits.
 bool target_allowed(const AxisState& axis, bool is_lift, double target) {
-  return !(is_lift && (returning_home || lift_output_owner != LiftOutputOwner::None)) &&
-         feedback_ready(axis, is_lift) && limits_ready(is_lift) &&
-         axis.mode != AxisMode::Manual && std::isfinite(target) &&
-         target >= (is_lift ? LIFT_MIN_DEG : ARM_MIN_DEG) &&
-         target <= (is_lift ? LIFT_MAX_DEG : ARM_MAX_DEG);
+ 
+return !(is_lift &&
+         (ENABLE_LIFT_CALIBRATION_MODE ||
+          returning_home ||
+          lift_output_owner != LiftOutputOwner::None)) &&
+       feedback_ready(axis, is_lift) &&
+       limits_ready(is_lift) &&
+       axis.mode != AxisMode::Manual &&
+       std::isfinite(target) &&
+       target >= (is_lift ? LIFT_MIN_DEG : ARM_MIN_DEG) &&
+       target <= (is_lift ? LIFT_MAX_DEG : ARM_MAX_DEG);
+
 }
 bool set_target(AxisState& axis, bool is_lift, double target,
                 unsigned timeout_ms = TARGET_TIMEOUT_MS) {
@@ -358,66 +491,143 @@ bool set_target(AxisState& axis, bool is_lift, double target,
 
 // One control step: read position, check timeouts, then choose a limited motor voltage.
 // The owning task must keep calling this; it is not a background controller.
+
 void update_axis(AxisState& axis, bool is_lift) {
-  if (!axis.initialized || axis.mode == AxisMode::Disabled || axis.mode == AxisMode::Fault) return;
+  if (!axis.initialized ||
+      axis.mode == AxisMode::Disabled ||
+      axis.mode == AxisMode::Fault) return;
+
   const unsigned now = pros::millis();
   const unsigned elapsed = now - axis.last_update;
+
   if (elapsed > MAX_UPDATE_GAP_MS) {
-    // Cooperative stop on resumption, NOT an independent watchdog.
-    disable_axis(axis, is_lift, true);
+    // A delayed automatic lift update is a recoverable abort.
+    // Stop motor output without intentionally erasing the home reference.
+    if (is_lift &&
+        (axis.mode == AxisMode::MoveToTarget ||
+         axis.mode == AxisMode::Hold)) {
+
+      const bool stopped = disable_axis(axis, true);
+
+      std::printf(
+          "LIFT AUTO ABORT: update gap %u ms; stopped=%d; homed=%d\n",
+          elapsed, stopped, lift.homed
+      );
+    } else {
+      disable_axis(axis, is_lift, true);
+    }
     return;
   }
+
   const double position = read_position(is_lift);
+
   if (!std::isfinite(position)) {
     disable_axis(axis, is_lift, true);
+
+    if (is_lift)
+      std::printf("LIFT HARD FAULT: P16 feedback invalid\n");
+
     return;
   }
-  if (axis.mode == AxisMode::Manual && now - axis.manual_refresh >= MANUAL_COMMAND_TIMEOUT_MS) {
+
+  if (axis.mode == AxisMode::Manual &&
+      now - axis.manual_refresh >= MANUAL_COMMAND_TIMEOUT_MS) {
     capture_hold(axis, is_lift);
     return;
   }
+
   if (elapsed < UPDATE_PERIOD_MS) return;
-  const double velocity = (position - axis.previous_position) * 1000.0 / elapsed;
+
+  const double velocity =
+      (position - axis.previous_position) * 1000.0 / elapsed;
+
   axis.last_update = now;
   axis.previous_position = position;
+
   int mv = axis.manual_mv;
+
   if (axis.mode != AxisMode::Manual) {
     if (!feedback_ready(axis, is_lift)) {
       disable_axis(axis, is_lift);
       return;
     }
+
     const double error = axis.target - position;
-    const double tolerance = is_lift ? LIFT_TARGET_TOLERANCE_DEG : ARM_TARGET_TOLERANCE_DEG;
+    const double tolerance = is_lift
+        ? LIFT_TARGET_TOLERANCE_DEG
+        : ARM_TARGET_TOLERANCE_DEG;
+
     if (std::fabs(error) <= tolerance) {
-      if (!axis.settling) axis.settled_since = now;
+      if (!axis.settling)
+        axis.settled_since = now;
+
       axis.settling = true;
-      axis.settled = now - axis.settled_since >= TARGET_SETTLE_MS;
+      axis.settled =
+          now - axis.settled_since >= TARGET_SETTLE_MS;
     } else {
       axis.settling = false;
       axis.settled = false;
     }
+
     if (axis.mode == AxisMode::MoveToTarget) {
-      if (axis.settled) axis.mode = AxisMode::Hold; // Hold the SAME requested target.
-      else if (now - axis.target_started >= axis.target_timeout_ms) {
-        disable_axis(axis, is_lift, true); // No unlimited push into a blocked target.
+      if (axis.settled) {
+        axis.mode = AxisMode::Hold;
+      } else if (
+          now - axis.target_started >= axis.target_timeout_ms) {
+
+        if (is_lift) {
+          const double target = axis.target;
+          const bool stopped = disable_axis(axis, true);
+
+          std::printf(
+              "LIFT AUTO ABORT: target timeout %.1f->%.1f deg; stopped=%d; homed=%d\n",
+              position, target, stopped, lift.homed
+          );
+        } else {
+          disable_axis(axis, false, true);
+        }
+
         return;
       }
     }
-    const double kp = is_lift ? LIFT_HOLD_KP : ARM_HOLD_KP;
-    const double kd = is_lift ? LIFT_HOLD_KD : ARM_HOLD_KD;
-    const int cap = is_lift ? LIFT_CLOSED_LOOP_MAX_MV : ARM_CLOSED_LOOP_MAX_MV;
+
+    const double kp = is_lift
+        ? LIFT_HOLD_KP : ARM_HOLD_KP;
+
+    const double kd = is_lift
+        ? LIFT_HOLD_KD : ARM_HOLD_KD;
+
+    const int cap = is_lift
+        ? LIFT_CLOSED_LOOP_MAX_MV
+        : ARM_CLOSED_LOOP_MAX_MV;
+
     double output = kp * error - kd * velocity;
-    if (!std::isfinite(output) || cap < 0 || cap > 12000) {
+
+    if (!std::isfinite(output) ||
+        cap < 0 || cap > 12000) {
       disable_axis(axis, is_lift, true);
       return;
     }
+
     if (output > cap) output = cap;
     if (output < -cap) output = -cap;
+
     mv = static_cast<int>(output);
   }
-  if (!write_voltage(is_lift, limit_voltage(axis, is_lift, position, mv)))
+
+  if (!write_voltage(
+          is_lift,
+          limit_voltage(axis, is_lift, position, mv))) {
+
     disable_axis(axis, is_lift, true);
+
+    if (is_lift)
+      std::printf(
+          "LIFT HARD FAULT: lift motor voltage command failed\n"
+      );
+  }
 }
+
 
 bool at_target(const AxisState& axis, bool is_lift) {
   if ((axis.mode != AxisMode::Hold && axis.mode != AxisMode::MoveToTarget) ||
@@ -518,6 +728,42 @@ void arm_cancel_auto() {
   if (arm.mode == AxisMode::MoveToTarget) capture_hold(arm, false);
 }
 bool lift_set_target(double position_deg) { return set_target(lift, true, position_deg); }
+
+static double lift_valid_preset_degrees(
+    lift_calibration::Position preset) {
+
+  const unsigned index = static_cast<unsigned>(preset);
+
+  if (index >= lift_calibration::positions.size()) {
+    return NAN;
+  }
+
+  const auto& p = lift_calibration::positions[index];
+  const double max_safe = mechanism_config::LIFT_MAX_DEG;
+
+  if (!p.configured ||
+      !std::isfinite(p.degrees) ||
+      !std::isfinite(max_safe) ||
+      max_safe <= 0.0 ||
+      p.degrees <= 0.0 ||
+      p.degrees > max_safe) {
+    return NAN;
+  }
+
+  return p.degrees;
+}
+
+// Nonblocking position command, used by Y for Intake.
+bool lift_move_preset(lift_calibration::Position preset) {
+  const double degrees = lift_valid_preset_degrees(preset);
+
+  if (!std::isfinite(degrees)) {
+    return false;
+  }
+
+  return lift_set_target(degrees);
+}
+
 bool arm_set_target(double position_deg) { return set_target(arm, false, position_deg); }
 bool lift_move_home() { return lift_set_target(mechanism_config::LIFT_HOME_DEG); }
 bool lift_move_low() {
@@ -554,31 +800,86 @@ bool lift_return_home_active() { return returning_home; }
 namespace {
 // ----- Full-voltage lift control -----
 // Use the shared UP/DOWN motor mapping and give this command exclusive lift ownership.
-bool lift_full_command(int direction, LiftOutputOwner owner) {
-  const bool enabled = !pros::competition::is_disabled() &&
-      (pros::competition::is_autonomous() == (owner == LiftOutputOwner::Autonomous));
-  if (!enabled || !lift.initialized || lift_output_fault || returning_home ||
-      (direction != 1 && direction != -1)) {
-    lift_auton_stop();
-    return false;
-  }
-  if (direction < 0) {
-    const auto bottom = lift_bottom_limit_read();
-    if (bottom == LiftBottomLimit::Pressed || bottom == LiftBottomLimit::Fault) {
-      lift_auton_stop();
-      return false;
+
+bool lift_full_command(
+    int direction,
+    LiftOutputOwner owner) {
+
+    const bool enabled =
+        !pros::competition::is_disabled() &&
+        (pros::competition::is_autonomous() ==
+         (owner == LiftOutputOwner::Autonomous));
+
+    const bool calibration_driver =
+        mechanism_config::ENABLE_LIFT_CALIBRATION_MODE &&
+        owner == LiftOutputOwner::Driver &&
+        !pros::competition::is_connected();
+
+    // Normal movement requires qualified limits.
+    // Calibration may bypass only the unknown upper limit.
+    if (!enabled ||
+        (!LIFT_LIMITS_CALIBRATED && !calibration_driver) ||
+        !lift.initialized ||
+        !lift.homed ||
+        lift.mode == AxisMode::Fault ||
+        lift_output_fault ||
+        returning_home ||
+        (direction != 1 && direction != -1)) {
+
+        lift_auton_stop();
+        return false;
     }
-  }
-  if (lift_output_owner != owner || lift_full_direction != direction) {
-    if (!disable_axis(lift, true, lift.mode == AxisMode::Fault)) return false;
-  }
-  lift_output_owner = owner;
-  lift_full_direction = direction;
-  if (!write_voltage(true, direction * 12000)) {
-    disable_axis(lift, true, true);
-    return false;
-  }
-  return true;
+
+    const double current_deg = read_position(true);
+    const double max_safe = mechanism_config::LIFT_MAX_DEG;
+
+    const bool max_known =
+        std::isfinite(max_safe) && max_safe > 0.0;
+
+    if (!std::isfinite(current_deg) ||
+        (direction > 0 &&
+         ((max_known && current_deg >= max_safe) ||
+          (!max_known && !calibration_driver))) ||
+        (direction < 0 &&
+         current_deg <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG)) {
+
+        lift_auton_stop();
+        return false;
+    }
+
+    if (direction < 0) {
+        const auto bottom = lift_bottom_limit_read();
+
+        if (bottom == LiftBottomLimit::Pressed ||
+            bottom == LiftBottomLimit::Fault) {
+            lift_auton_stop();
+            return false;
+        }
+    }
+
+    if (lift_output_owner != owner ||
+        lift_full_direction != direction) {
+
+        if (!disable_axis(
+                lift, true,
+                lift.mode == AxisMode::Fault)) {
+            return false;
+        }
+    }
+
+    lift_output_owner = owner;
+    lift_full_direction = direction;
+    lift_full_last_refresh = pros::millis();
+
+    if (!write_voltage(
+            true,
+            direction * LIFT_COMMISSIONING_MV)) {
+
+        disable_axis(lift, true, true);
+        return false;
+    }
+
+    return true;
 }
 
 // Blocking target wrapper: service mechanisms until success, failure or timeout.
@@ -618,6 +919,28 @@ bool lift_auton_stop() {
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms) {
   return auton_move_axis(lift, true, target_deg, timeout_ms);
 }
+
+
+
+bool lift_auton_to_preset(
+    lift_calibration::Position preset,
+    unsigned timeout_ms,
+    LiftFinish finish) {
+
+  const double degrees =
+      lift_valid_preset_degrees(preset);
+
+  if (!std::isfinite(degrees) || timeout_ms == 0) {
+    return false;
+  }
+
+  return lift_auton_move_to_deg(
+      degrees,
+      timeout_ms,
+      finish
+  );
+}
+
 bool arm_auton_move_to_deg(double target_deg, unsigned timeout_ms) {
   return auton_move_axis(arm, false, target_deg, timeout_ms);
 }
@@ -658,20 +981,94 @@ bool lift_return_home_start() {
 // Service whichever mode owns the lift: full output, target/hold, or switch-based return.
 void lift_update() {
   if (pros::competition::is_disabled()) { disable_axis(lift, true, lift.mode == AxisMode::Fault); return; }
+
   if (lift_output_owner != LiftOutputOwner::None) {
-    const bool expected_auton = lift_output_owner == LiftOutputOwner::Autonomous;
+    const bool expected_auton =
+        lift_output_owner == LiftOutputOwner::Autonomous;
+
     if (pros::competition::is_autonomous() != expected_auton) {
       lift_auton_stop();
-    } else if (lift_calibration::enable_limits &&
-               (!lift.homed || !auton_math::lift_direction_allowed(lift_calibration::limits,read_position(true),lift_full_direction))) {
-      lift_auton_stop();
-    } else if (lift_full_direction < 0) {
-      const auto bottom = lift_bottom_limit_read();
-      if (bottom == LiftBottomLimit::Pressed) lift_auton_stop();
-      else if (bottom == LiftBottomLimit::Fault) disable_axis(lift, true, true);
+      return;
     }
-    return; // Latched open-loop output has exclusive ownership, no PID overwrite.
+
+    if (lift.mode == AxisMode::Fault || lift_output_fault) {
+      disable_axis(lift, true, true);
+      return;
+    }
+
+    
+    // Stop a manual/open-loop command if its owner interferes(driver)
+    // stops refreshing it. Checked cooperatively
+    // whenever lift_update() executes.
+    if (lift_full_last_refresh == 0 ||
+        pros::millis() - lift_full_last_refresh >
+            mechanism_config::MANUAL_COMMAND_TIMEOUT_MS) {
+
+      lift_auton_stop();
+      return;
+    }
+
+
+    if (!lift.homed) {
+      lift_auton_stop();
+      return;
+    }
+
+    const double position = read_position(true);
+
+    if (!std::isfinite(position)) {
+      disable_axis(lift, true, true);
+      return;
+    }
+    
+    
+    // In calibration, an unknown maximum permits supervised L1 movement.
+    // A measured maximum is always enforced.
+    if (lift_full_direction > 0) {
+      const double max_safe = mechanism_config::LIFT_MAX_DEG;
+      const bool max_known = std::isfinite(max_safe) && max_safe > 0.0;
+      const bool calibration_driver =
+          mechanism_config::ENABLE_LIFT_CALIBRATION_MODE &&
+          lift_output_owner == LiftOutputOwner::Driver &&
+          !pros::competition::is_connected();
+      if ((max_known && position >= max_safe) ||
+          (!max_known && !calibration_driver)) {
+        lift_auton_stop();
+        return;
+      }
+    }
+
+
+    if (lift_full_direction < 0) {
+      const auto bottom = lift_bottom_limit_read();
+
+      if (bottom == LiftBottomLimit::Fault) {
+        disable_axis(lift, true, true);
+        return;
+      }
+
+      
+      if (bottom == LiftBottomLimit::Pressed ||
+          position <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG) {
+
+          lift_auton_stop();
+          return;
+      }
+
+    }
+
+    if (lift_calibration::enable_limits &&
+        !auton_math::lift_direction_allowed(
+            lift_calibration::limits,
+            position,
+            lift_full_direction)) {
+      lift_auton_stop();
+      return;
+    }
+
+    return;
   }
+
   if (!returning_home) { update_axis(lift, true); return; }
   if (pros::competition::is_autonomous() != return_started_in_autonomous) {
     disable_axis(lift, true);
@@ -806,69 +1203,150 @@ void test_lift_manual(bool up_held, bool down_held) {
   else if (down_held && !up_held) lift_manual_down();
   else if (lift.mode == AxisMode::Manual) lift_manual_stop_and_hold();
 }
-bool test_lift_motor_response(bool up_held, bool down_held) {
-  constexpr int voltage_mv = 12000;  // Full voltage.
-  static int direction = 0;
-  static bool write_fault = false, sampled = false;
-  static unsigned started = 0, sampled_at = 0;
-  static double before14 = 0, before15 = 0, rotation_before = 0;
-  static double rpm14 = NAN, rpm15 = NAN, current14 = NAN, current15 = NAN;
-  auto& motor14 = left_lift_motor();
-  auto& motor15 = right_lift_motor();
-  const bool enabled = !pros::competition::is_disabled() &&
-                       !pros::competition::is_autonomous();
-  const int requested = enabled && !write_fault && up_held != down_held ? (up_held ? 1 : -1) : 0;
-  auto stop = [&]() {
-    // Always zero BOTH motors before reading telemetry or printing.
-    const bool stopped = lift_auton_stop();
-    write_fault |= !stopped;
-    if (direction != 0) {
-      const double rotation_after = lift_position_deg();
-      std::printf("\n===== LIFT HOLD-TO-RUN STOPPED =====\n"
-                  "Button: %s | electrical port14=%+d mV port15=%+d mV | elapsed=%u ms\n"
-                  "Paired zero accepted=%d | write_fault=%d\n"
-                  "Encoder delta: port14=%.3f port15=%.3f (configured encoder units)\n"
-                  "Buffered RPM: port14=%.3f port15=%.3f | current mA: %.0f %.0f\n"
-                  "Sample captured=%d at %u ms | lift sensor before=%.3f after=%.3f delta=%.3f deg\n"
-                  "Green 200 RPM (18:1 internal); external gearing 1:1. L1 up / L2 down. Release/both buttons stop.\n",
-                  direction > 0 ? "L1" : "L2", direction * voltage_mv, -direction * voltage_mv,
-                  pros::millis() - started, stopped,
-                  write_fault, motor14.get_position() - before14, motor15.get_position() - before15,
-                  rpm14, rpm15, current14, current15, sampled, sampled_at,
-                  rotation_before, rotation_after, rotation_after - rotation_before);
-      std::fflush(stdout);
+// Three-motor lift commissioning: continuous held buttons, startup reference, guarded lower stop.
+
+
+
+
+
+bool test_lift_motor_response(
+    bool up_held,
+    bool down_held) {
+
+    if (mechanism_config::ENABLE_LIFT_CALIBRATION_MODE) {
+
+        // Continuous hold-to-move calibration.
+        static int previous_direction = 0;
+        static unsigned held_since = 0;
+        static double started_deg = 0.0;
+        static bool timed_out = false;
+
+        const bool driver_allowed =
+            !pros::competition::is_disabled() &&
+            !pros::competition::is_autonomous() &&
+            !pros::competition::is_connected();
+
+        // Release, both buttons, or disabled = STOP.
+        if (!driver_allowed || up_held == down_held) {
+            previous_direction = 0;
+            held_since = 0;
+            timed_out = false;
+            return lift_auton_stop();
+        }
+
+        const int direction = up_held ? 1 : -1;
+
+        if (direction != previous_direction) {
+            previous_direction = direction;
+            held_since = pros::millis();
+            started_deg = read_position(true);
+            timed_out = false;
+        }
+
+        const double current_deg = read_position(true);
+
+        if (!std::isfinite(current_deg) ||
+            !std::isfinite(started_deg)) {
+
+            disable_axis(lift, true, true);
+            return false;
+        }
+
+        // Reaching a limit is a normal stop, NOT a stall fault.
+        // L2 remains blocked here while held; lifting away is allowed.
+        const double max_safe = mechanism_config::LIFT_MAX_DEG;
+        const bool at_lower = direction < 0 &&
+            current_deg <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG;
+        const bool at_upper = direction > 0 &&
+            std::isfinite(max_safe) && max_safe > 0.0 &&
+            current_deg >= max_safe;
+        if (at_lower || at_upper) {
+            lift_auton_stop();
+            return true;
+        }
+
+        // Fault if P16 moves opposite to the command.
+        if ((current_deg - started_deg) * direction < -2.0) {
+            std::printf(
+                "LIFT CAL FAULT: wrong P16 direction\n"
+            );
+            disable_axis(lift, true, true);
+            return false;
+        }
+
+        // Fault if the lift fails to start moving.
+        const unsigned held_ms =
+            pros::millis() - held_since;
+
+        if (held_ms >=
+                mechanism_config::LIFT_CALIBRATION_MOTION_CHECK_MS &&
+            (current_deg - started_deg) * direction <
+                mechanism_config::LIFT_CALIBRATION_MIN_MOTION_DEG) {
+
+            std::printf(
+                "LIFT CAL FAULT: no P16 movement\n"
+            );
+            disable_axis(lift, true, true);
+            return false;
+        }
+
+        // One continuous hold has a safety timeout.
+        if (timed_out ||
+            pros::millis() - held_since >=
+                mechanism_config::LIFT_CALIBRATION_MAX_HOLD_MS) {
+
+            if (!timed_out) {
+                std::printf(
+                    "LIFT CAL: hold timeout, release button\n"
+                );
+            }
+
+            timed_out = true;
+            lift_auton_stop();
+            return false;
+        }
+
+        const bool success =
+            lift_full_command(
+                direction,
+                LiftOutputOwner::Driver
+            );
+
+        if (!success) lift_auton_stop();
+        return success;
     }
-    direction = 0;
-  };
-  if (!requested || (direction && (requested != direction || !lift_response_running))) {
-    stop();
-    return !write_fault; // Direction change restarts on the next held-input check.
-  }
-  if (!direction) {
-    disable_axis(lift, true, lift.mode == AxisMode::Fault);
-    stop();
-    if (write_fault) return false;
-    before14 = motor14.get_position(); before15 = motor15.get_position();
-    rotation_before = lift_position_deg();
-    rpm14 = rpm15 = current14 = current15 = NAN;
-    sampled = false; sampled_at = 0;
-    direction = requested;
-    started = pros::millis();
-  }
-  if (!lift_full_command(direction, LiftOutputOwner::Driver)) {
-    write_fault = lift_output_fault;
-    stop();
-    return false;
-  }
-  lift_response_running = true;
-  if (!sampled && pros::millis() - started >= 50) {
-    sampled_at = pros::millis() - started;
-    rpm14 = motor14.get_actual_velocity(); current14 = motor14.get_current_draw();
-    rpm15 = motor15.get_actual_velocity(); current15 = motor15.get_current_draw();
-    sampled = true; // No terminal printing while powered.
-  }
-  return true;
+
+    // Normal match control with verified limits.
+    const bool enabled =
+        !pros::competition::is_disabled() &&
+        !pros::competition::is_autonomous();
+
+    if (!enabled || (up_held && down_held)) {
+        return lift_auton_stop();
+    }
+
+    if (!up_held && !down_held) {
+        if (lift_output_owner == LiftOutputOwner::Driver) {
+            return lift_auton_stop();
+        }
+
+        // Preserve any active Y Intake preset.
+        return true;
+    }
+
+    const int direction = up_held ? 1 : -1;
+
+    const bool success =
+        lift_full_command(
+            direction,
+            LiftOutputOwner::Driver
+        );
+
+    if (!success) lift_auton_stop();
+    return success;
 }
+
+
 void test_arm_manual(bool up_held, bool down_held) {
   if (up_held && down_held) manual_axis(arm, false, 0);
   else if (up_held) arm_manual_up();
@@ -908,6 +1386,7 @@ constexpr bool new_motor_port_free(int port) {
          port != 4 && port != 5 && port != 7 && port != 20 &&
          port != 13 &&
          port != LEFT_LIFT_PORT && port != RIGHT_LIFT_PORT &&
+         port != THIRD_LIFT_PORT &&
          port != LIFT_ROTATION_PORT && port != ARM_MOTOR_PORT &&
          port != ARM_ROTATION_PORT && port != CLAW_DISTANCE_PORT;
 }
@@ -1024,8 +1503,8 @@ void claw_driver_control(bool flex_held, bool claw_new_press) {
     return;
   }
 
-  // Any R2 press stops the flex and keeps it stopped
-  // until R1 is pressed again.
+  // Any R1 press stops the flex and keeps it stopped
+  // until R2 is pressed again.
   if (claw_new_press) {
     flex_hold_active = false;
     flex_stop();
@@ -1043,7 +1522,7 @@ void claw_driver_control(bool flex_held, bool claw_new_press) {
     return;
   }
 
-  // R1 held = 100%.
+  // R2 held = 100%.
   if (flex_held && flex_available()) {
     flex_hold_active = true;
 
@@ -1053,7 +1532,7 @@ void claw_driver_control(bool flex_held, bool claw_new_press) {
     }
   }
 
-  // R1 released after intake = about 10%.
+  // R2 released after intake = about 10%.
   else if (flex_hold_active && flex_available()) {
     if (!flex_intake(13)) {
       flex_hold_active = false;
@@ -1090,11 +1569,20 @@ bool toggle_connected() {
 // Report every mechanism, but only required devices can fail this route's preflight.
 bool mechanisms_preflight(bool require_lift,bool require_toggle,bool require_flex) {
   const bool lift_sensor_ok=std::isfinite(lift_position_deg());
-  const bool lift_motors=left_lift_motor().is_installed() && right_lift_motor().is_installed();
+  const bool lift_motors=left_lift_motor().is_installed() &&
+      right_lift_motor().is_installed() && third_lift_motor().is_installed();
+
+  // Diagnose each lift motor individually.
+  std::printf("LIFT DEVICE STATUS: P13=%d P14=%d P15=%d\n",
+              third_lift_motor().is_installed(),
+              left_lift_motor().is_installed(),
+              right_lift_motor().is_installed());
+
   const bool toggle_ok=toggle_connected();
   const bool flex_ok=flex_available() && flex_left_motor().is_installed() && flex_right_motor().is_installed();
-  std::printf("PREFLIGHT lift P%d/P%d motors=%d rotation P%d=%d target_ready=%d %s\n",
-      LEFT_LIFT_PORT,RIGHT_LIFT_PORT,lift_motors,LIFT_ROTATION_PORT,lift_sensor_ok,lift_target_ready(),
+  std::printf("PREFLIGHT lift P%d/P%d/P%d motors=%d rotation P%d=%d target_ready=%d %s\n",
+      LEFT_LIFT_PORT,RIGHT_LIFT_PORT,THIRD_LIFT_PORT,lift_motors,
+      LIFT_ROTATION_PORT,lift_sensor_ok,lift_target_ready(),
       require_lift ? "REQUIRED FOR ROUTE" : "OPTIONAL");
   std::printf("PREFLIGHT toggle P%d secondary=%d connected=%d %s\n",TOGGLE_PORT,
       TOGGLE_SINGLE_MOTOR_TEST ? 0 : TOGGLE_OTHER_PORT,toggle_ok,

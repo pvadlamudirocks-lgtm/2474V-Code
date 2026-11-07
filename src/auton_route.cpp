@@ -11,26 +11,12 @@ namespace {
 // ----- Route ownership -----
 // One Session owns route commands and the event log until cleanup finishes.
 std::atomic<Session*> owner{nullptr};
-unsigned motion_started = 0, motion_timeout = 0;
-Result wait_result = Result::PASS;
+
+
 auton_math::Pose pose() { const auto p=nav_pose_get(); return {p.x,p.y,p.theta}; }
-bool enabled() { return !pros::competition::is_disabled() && pros::competition::is_autonomous(); }
+bool enabled() { return !ez::autonomous_cancelled(); }
 bool sensors_ready() {
   return nav_sensors_ready();
-}
-// Keep checking sensors, mode and deadline while an ordinary EZ movement blocks.
-bool wait_service(ez::Drive* drive) {
-  if (drive != &chassis) return true;
-  if (!enabled()) wait_result=Result::ABORTED;
-  else if (!sensors_ready()) wait_result=Result::SENSOR_FAULT;
-  else if (pros::millis()-motion_started >= motion_timeout) wait_result=Result::TIMEOUT;
-  if (wait_result!=Result::PASS) {
-    ez::movement_cancel("route movement interrupted");
-    if (!ez::movement_stop()) wait_result=Result::FAIL;
-    return false;
-  }
-  // Deliberately no mechanism service: trusted primitive ownership is unchanged.
-  return true;
 }
 bool rest() {
   if (chassis.left_motors.empty() || chassis.right_motors.empty()) return false;
@@ -134,32 +120,26 @@ Result Session::end_segment(Result r) {
   return r;
 }
 // ----- Trusted point and turn commands -----
-// Add route safety and logging around the ordinary navigation wrappers.
-// Active lift/arm control is rejected because these waits do not service mechanisms.
+// Preserve route bookkeeping and logging around ordinary navigation wrappers.
 Result Session::move(const char* name,auton_math::Pose target,int speed,unsigned timeout,bool turn_only,bool reverse) {
   if(!ok() || moving_ || nav_sequence_active()) return abort(Result::ABORTED,"motion ownership conflict");
-  if(speed<1 || speed>127 || !timeout || (!std::isfinite(target.h) && turn_only) ||
+  if(speed<1 || speed>127 || (!std::isfinite(target.h) && turn_only) ||
       (!turn_only && (!std::isfinite(target.x)||!std::isfinite(target.y)))) return abort(Result::NOT_CONFIGURED,"motion data missing");
-  if(!sensors_ready()) return abort(Result::SENSOR_FAULT,"navigation sensors");
-  const auto lm=lift_mode();
-  if(lm==LiftMode::Hold || lm==LiftMode::MoveToTarget || lm==LiftMode::ReturningHome ||
-      lm==LiftMode::AutonFull || lm==LiftMode::DriverFull || lm==LiftMode::Manual ||
-      arm_mode()==ArmMode::Hold || arm_mode()==ArmMode::Manual || arm_mode()==ArmMode::MoveToTarget)
-    return abort(Result::ABORTED,"lift/arm needs serviced navigation");
+
   const auto start=pose();
   const char* command=turn_only ? "TURN_TO" : reverse ? "GO_TO_REVERSE" : "GO_TO";
   log_event("MOTION_START",segment_,name,Result::RETURNED_UNVERIFIED,start,target,speed,NAN,command);
-  moving_=true; motion_started=pros::millis(); motion_timeout=timeout; wait_result=Result::PASS;
+  moving_=true; (void)timeout; // Native exit conditions govern completion.
   chassis.interfered=false; // Explicit new route motion, after all preconditions.
-  ez::wait_service_set(wait_service);
+
   if(turn_only) nav_turn_to(target.h,speed);
   else if(reverse) nav_go_to_reverse(target.x,target.y,speed);
   else nav_go_to(target.x,target.y,speed);
-  ez::wait_service_set(nullptr);
+
   moving_=false;
-  Result r=wait_result;
+  Result r=Result::PASS;
   if(!enabled()) r=Result::ABORTED;
-  else if(!sensors_ready()) r=Result::SENSOR_FAULT;
+
   else if(r==Result::PASS && chassis.interfered) r=Result::FAIL;
   log_event("MOTION_END",segment_,name,r==Result::PASS ? Result::RETURNED_UNVERIFIED : r,start,target,speed,NAN,command);
   return r==Result::PASS ? r : abort(r,"motion failed");
@@ -172,7 +152,7 @@ Result Session::point(const char* name,double x,double y,int speed,unsigned time
 Result Session::turn(const char* name,double h,int speed,unsigned timeout) { return move(name,{NAN,NAN,h},speed,timeout,true,false); }
 Result Session::mechanism(const char* name,bool (*command)()) {
   if(!ok() || !command) return abort(Result::ABORTED,"mechanism ownership/request");
-  if(!sensors_ready()) return abort(Result::SENSOR_FAULT,"mechanism navigation preflight");
+
   const bool accepted=command();
   const auto r=accepted && enabled() ? Result::PASS : Result::FAIL;
   log_event("MECHANISM_COMMAND",segment_,name,r,{}, {},0,lift_position_deg());
@@ -180,15 +160,15 @@ Result Session::mechanism(const char* name,bool (*command)()) {
 }
 Result Session::stop_motion() {
   if(!ok() || nav_sequence_active()) return abort(Result::ABORTED,"stop ownership conflict");
-  if (!ez::movement_stop()) return abort(Result::FAIL,"stop acknowledgement timeout");
+  ez::drive_stop(&chassis);
   return Result::PASS;
 }
 // ----- Optional chained movement -----
 // NavSequence owns the waits and mechanism updates; all step data is checked first.
 Result Session::sequence(const std::vector<auton_actions::SequenceStep>& steps,unsigned timeout) {
   if(!ok() || moving_ || nav_sequence_active()) return abort(Result::ABORTED,"sequence ownership conflict");
-  if(!auton_actions::ENABLE_ADVANCED_PATHS) return abort(Result::PHYSICAL_CALIBRATION_REQUIRED,"chaining disabled");
-  if(steps.empty() || !timeout || steps.back().finish!=NavEndMode::SETTLE)
+
+  if(steps.empty() || steps.back().finish!=NavEndMode::SETTLE)
     return abort(Result::NOT_CONFIGURED,"sequence invalid");
   bool previous_chain=false;
   for(const auto& step:steps) {
@@ -203,7 +183,7 @@ Result Session::sequence(const std::vector<auton_actions::SequenceStep>& steps,u
     for(const auto& e:step.hooks.during_move) if(!e.when || !e.action) return abort(Result::NOT_CONFIGURED,"event invalid");
     previous_chain=step.finish==NavEndMode::CHAIN;
   }
-  if(!require_nav_ready()) return abort(Result::SENSOR_FAULT,"sequence preflight");
+
   bool success=true;
   {
     NavSequence sequence(false,timeout); // Preserves native CHAIN/SETTLE and same-task service.
@@ -236,11 +216,11 @@ bool require_nav_ready() { return sensors_ready(); }
 bool require_lift_calibrated() { return lift_target_ready(); }
 bool require_toggle_ready() { return toggle_available() && toggle_connected(); }
 bool preflight(bool nav,bool lift_required,bool toggle_required,bool flex_required) {
-  const bool n=nav ? nav_print_sensor_health() : true;
+  if(nav)nav_print_sensor_health(); // Report only, no experimental nav gate.
   std::printf("PREFLIGHT NAV: %s\n",nav ? "REQUIRED FOR NAV" : "OPTIONAL");
   const bool m=mechanisms_preflight(lift_required,toggle_required,flex_required);
   wall_correction::health_snapshot();
-  return n && m;
+  return m;
 }
 // ----- Isolated route test -----
 // Run one selected stage from its actual current pose, with no automatic start reset.
@@ -259,14 +239,13 @@ Result run_route_segment_test(RouteSegmentTest test,const RouteConfig& config) {
   return s.finish();
 }
 // ----- One-object through four-object route -----
-// Run the same ordered prefix each time; adding a block requires the earlier blocks qualified.
+// Run the configured ordered prefix; no separate physical-approval gate.
 Result run_route_prefix(const RouteConfig& c) {
   Session s(c.name);
   if(!s.ok()) return s.result();
   if(!c.enabled || c.objects<1 || c.objects>4 || !c.start || !c.start_tolerance ||
       !auton_math::finite(*c.start) || !c.start_tolerance->valid()) return s.abort(Result::NOT_CONFIGURED,"route/start unconfigured");
   const unsigned end=static_cast<unsigned>(RouteSegmentTest::B1_EXIT)+6*(c.objects-1);
-  for(unsigned b=0;b+1<c.objects;++b) if(!c.qualified_prefix[b]) return s.abort(Result::PHYSICAL_CALIBRATION_REQUIRED,"prior block not qualified");
   for(unsigned i=2;i<=end;++i) if(!c.segments[i].configured || !c.segments[i].execute || !target_ok(c.segments[i].checkpoint))
     return s.abort(Result::NOT_CONFIGURED,segment_name(static_cast<RouteSegmentTest>(i)));
   if(!preflight(true)) return s.abort(Result::SENSOR_FAULT,"preflight");

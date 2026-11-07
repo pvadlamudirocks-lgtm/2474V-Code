@@ -49,7 +49,6 @@ struct RouteConfig {
   std::optional<auton_math::Pose> start;
   std::optional<auton_math::Tolerance> start_tolerance;
   std::array<Segment, static_cast<unsigned>(RouteSegmentTest::COUNT)> segments{};
-  std::array<bool,4> qualified_prefix{}; // B2 requires proven B1, etc.
 };
 // Single autonomous task owner. New route layer never uses pose-Boomerang.
 class Session {
