@@ -17,7 +17,7 @@ bool port_free() {
   const int port = LIFT_HEIGHT_DISTANCE_PORT;
   if (port < 1 || port > 21) return false;
   // Current drive, tracking and IMU map; P13 is reserved by existing port checks.
-  for (int used : {1, 2, 3, 4, 5, 7, 13, 20, LEFT_LIFT_PORT, RIGHT_LIFT_PORT,
+  for (int used : {6, 2, 3, 4, 5, 7, 13, 20, LEFT_LIFT_PORT, RIGHT_LIFT_PORT,
                    LIFT_ROTATION_PORT, ARM_MOTOR_PORT, ARM_ROTATION_PORT,
                    CLAW_DISTANCE_PORT, FLEX_LEFT_PORT, FLEX_RIGHT_PORT,
                    TOGGLE_PORT, TOGGLE_OTHER_PORT})

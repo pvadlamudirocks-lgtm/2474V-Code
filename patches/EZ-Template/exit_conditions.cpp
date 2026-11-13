@@ -9,7 +9,20 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #include "EZ-Template/navigation_hooks.hpp"
 #include <atomic>
 // Project addition: cooperative servicing only; original exit math is unchanged.
-namespace { std::atomic<ez::WaitService> wait_service{nullptr}; }
+namespace {
+std::atomic<ez::WaitService> wait_service{nullptr};
+std::atomic<ez::NativeOdomExitObserver> native_odom_exit_observer{nullptr};
+std::atomic<ez::Drive*> native_wait_drive{nullptr};
+std::atomic<bool> native_wait_completed{false};
+std::atomic<int> native_wait_xy{-1}, native_wait_angular{-1};
+}
+void ez::native_odom_exit_observer_set(NativeOdomExitObserver observer) {
+  native_odom_exit_observer.store(observer);
+}
+ez::NativeOdomWaitResult ez::native_odom_wait_result(Drive* drive) {
+  if (native_wait_drive.load() != drive || !native_wait_completed.load()) return {};
+  return {true,native_wait_xy.load(),native_wait_angular.load()};
+}
 void ez::wait_service_set(WaitService service) { wait_service.store(service); }
 bool ez::wait_service_tick(Drive* drive) {
   if (geometry_turn_deadline_stopped(drive)) return false;
@@ -111,6 +124,9 @@ void Drive::pid_odom_turn_exit_condition_set(okapi::QTime p_small_exit_time, oka
 
 // User wrapper for exit condition
 void Drive::pid_wait() {
+  native_wait_completed.store(false);
+  native_wait_xy.store(-1); native_wait_angular.store(-1);
+  native_wait_drive.store(this);
   // Let the PID run at least 1 iteration
   pros::delay(util::DELAY_TIME); if (!ez::wait_service_tick(this)) return;
 
@@ -159,6 +175,8 @@ void Drive::pid_wait() {
       current_a_odomPID.velocity_sensor_secondary_set(drive_imu_accel_get());
       xy_exit = xy_exit != RUNNING ? xy_exit : xyPID.exit_condition({left_motors[0], right_motors[0]});
       a_exit = a_exit != RUNNING ? a_exit : current_a_odomPID.exit_condition({left_motors[0], right_motors[0]});
+      if (auto observer = native_odom_exit_observer.load())
+        observer(this, static_cast<int>(xy_exit), static_cast<int>(a_exit));
       pros::delay(util::DELAY_TIME); if (!ez::wait_service_tick(this)) return;
     }
     if (print_toggle) std::cout << "  XY: " << exit_to_string(xy_exit) << " Exit, error: " << xyPID.error << ".   Angle: " << exit_to_string(a_exit) << " Exit, error: " << current_a_odomPID.error << ".\n";
@@ -166,6 +184,11 @@ void Drive::pid_wait() {
     if (xy_exit == mA_EXIT || xy_exit == VELOCITY_EXIT || a_exit == mA_EXIT || a_exit == VELOCITY_EXIT) {
       interfered = true;
     }
+    // Publish already evaluated native results even when no diagnostic callback exists.
+    // Early cancellation/service returns above leave completed=false.
+    native_wait_xy.store(static_cast<int>(xy_exit));
+    native_wait_angular.store(static_cast<int>(a_exit));
+    native_wait_completed.store(true);
   }
 
   // Turn Exit

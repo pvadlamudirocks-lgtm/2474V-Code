@@ -8,31 +8,12 @@
 #include "subsystems.hpp"
 #include <cstdio>
 
-namespace {
-unsigned captured_at = 0, written_at = 0, next_row = 0;
-bool captured = false, written = false;
-std::array<telemetry_format::Row, 3> rows{};
-}
 void telemetry_reset() {
-  captured = written = false; next_row = 0;
   lift_height_telemetry_reset();
 }
-void telemetry_update(pros::Controller& controller) {
+void telemetry_update(pros::Controller&) {
+  // Preserve sensor sampling without writing/clearing the competition display.
   lift_height_telemetry_update();
-  const unsigned now = pros::millis();
-  if (!captured || now - captured_at >= 100) {
-    captured = true; captured_at = now;
-    const auto pose = nav_pose_get();
-    const bool pose_valid = nav_sensors_ready();
-    rows = telemetry_format::dashboard(pose_valid ? pose.theta : NAN,
-        pose_valid ? pose.x : NAN, pose_valid ? pose.y : NAN, lift_position_deg());
-  }
-  // Installed PROS misc.h: wireless writes faster than 50 ms may be discarded.
-  // One row per 50 ms gives all three rows a reliable ~150 ms refresh.
-  if (written && now - written_at < 50) return;
-  written = true; written_at = now;
-  if (controller.print(next_row, 0, "%s", rows[next_row].data()) != PROS_ERR)
-    next_row = (next_row + 1) % rows.size();
 }
 void print_robot_telemetry() {
   lift_height_telemetry_update();

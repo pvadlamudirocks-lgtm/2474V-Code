@@ -11,7 +11,7 @@ class NavSequence {
   ~NavSequence();
   NavSequence(const NavSequence&) = delete;
   NavSequence& operator=(const NavSequence&) = delete;
-  bool ok() const;
+  bool ok() const;  
   bool finish();
  private:
   bool owner_ = false;
@@ -32,6 +32,7 @@ bool nav_events(std::vector<NavEvent> events);
 bool nav_ok();
 bool nav_sequence_active(); // Ownership, including faulted sequences awaiting finish.
 const char* nav_fault();
+bool nav_sequence_rest_verified(); // Result of the last sequence finish/rest check.
 void nav_abort(const char* reason = "caller abort"); // reason must have static lifetime
 void nav_trace_marker(); // Buffered harmless mechanism-event marker.
 void nav_trace_dump();   // Allowed only after sequence finish and measured rest.

@@ -1,3 +1,4 @@
+#include "dev_tests.hpp"
 #include "nav_sequence.hpp"
 #include "subsystems.hpp"
 #include "nav_diagnostics.hpp"
@@ -14,6 +15,7 @@ bool active = false, waiting = false, pending = false, busy = false, tracing = f
 bool print_before = false, encoder_motion = false, turn_motion = false;
 const char* fault = nullptr;
 unsigned started = 0, sequence_start = 0, movement = 0;
+unsigned motion_timeout_ms = 8000;
 ez::pose target{}, previous_pose{};
 double traveled = 0, left_target = 0, right_target = 0, turn_target = 0;
 std::vector<NavEvent> queued, events;
@@ -147,6 +149,7 @@ void capture_controller(Row& row) { ez::NavAccess::capture_controller(row); }
 
 bool nav_ok() { return (!active || (!fault && !chassis.interfered)) && !ez::autonomous_cancelled(); }
 bool nav_sequence_active() { return active; }
+bool nav_sequence_rest_verified() { return rest_verified; }
 const char* nav_fault() { return fault ? fault : chassis.interfered ? "EZ interference" : "none"; }
 void nav_abort(const char* reason) {
   if (!fault) fault = reason;
@@ -172,6 +175,7 @@ bool service(ez::Drive* drive) {
   if (pros::competition::is_disabled() || !pros::competition::is_autonomous()) {
     nav_abort("competition mode changed"); return false;
   }
+  if (pros::millis() - started >= motion_timeout_ms) { nav_abort("movement timeout"); return false; }
   if (!nav_ok()) { nav_abort("EZ interference"); return false; }
   const auto p = nav_pose_get();
   traveled += std::hypot(p.x - previous_pose.x, p.y - previous_pose.y);
@@ -223,7 +227,7 @@ NavSequence::NavSequence(bool trace, unsigned deadline) {
   print_before = chassis.pid_print_toggle_get(); chassis.pid_print_toggle(false);
   tracing = trace; row_count = dropped = zero_events = movement = 0;
   was_zero = true; left_sign = right_sign = 0;
-  (void)deadline; // Legacy API parameter; no custom movement deadline.
+  motion_timeout_ms = deadline; // Per-movement cooperative deadline.
   sequence_start = pros::millis();
   ez::wait_service_set(service); ez::command_observer_set(observe_command);
 }
@@ -234,9 +238,11 @@ bool NavSequence::finish() {
   if (!owner_) return false;
   if (pending && nav_ok()) {
     ez::navigation_lock(); ez::NavAccess::restore_target(); ez::navigation_unlock();
-    pending = false; waiting = true; started = pros::millis();
+    pending = false; waiting = true; // Preserve original CHAIN deadline.
     events.clear(); fired.clear();
-    chassis.pid_wait(); waiting = false;
+    if (pros::millis() - started < motion_timeout_ms) chassis.pid_wait();
+    waiting = false;
+    if (pros::millis() - started >= motion_timeout_ms) nav_abort("movement timeout");
     if (!nav_ok()) nav_abort("native movement interrupted");
   }
   if (!queued.empty()) nav_abort("unconsumed events");
@@ -249,7 +255,7 @@ bool NavSequence::finish() {
   if (!rest_verified) std::printf("SEQUENCE REST: unverified (report only)\n");
   sample(FINISH);
   stop_all_mechanisms();
-  const bool result = !fault && !chassis.interfered;
+  const bool result = nav_ok();
   ez::wait_service_set(nullptr); ez::command_observer_set(nullptr);
   chassis.pid_print_toggle(print_before);
   active = false; owner_ = false; waiting = busy = pending = false;
@@ -272,6 +278,7 @@ bool nav_detail::move(const std::function<void()>& dispatch, NavEndMode end,
     return !chassis.interfered && !ez::autonomous_cancelled();
   }
   if (busy) { nav_abort("recursive navigation from event"); return false; }
+  if (!motion_timeout_ms || (pending && pros::millis()-started >= motion_timeout_ms)) { nav_abort("movement timeout"); return false; }
   busy = true; pending = false; encoder_motion = encoder; turn_motion = turn;
   target = requested; previous_pose = nav_pose_get(); traveled = 0;
   events = std::move(queued); queued.clear(); fired.assign(events.size(), false);
@@ -284,6 +291,7 @@ bool nav_detail::move(const std::function<void()>& dispatch, NavEndMode end,
   waiting = true;
   if (end == NavEndMode::CHAIN) chassis.pid_wait_quick_chain(); else chassis.pid_wait();
   waiting = false;
+  if (pros::millis()-started >= motion_timeout_ms) nav_abort("movement timeout");
   // Native CHAIN release is an intermediate handoff, not final pose acceptance.
   for (unsigned i = 0; i < events.size(); ++i)
     if (events[i].required && !fired[i]) nav_abort("required movement event not reached");
@@ -363,6 +371,8 @@ void nav_cancel_sequence() {
   // PROS competition lifecycle has stopped the old autonomous task before reuse.
   ez::wait_service_set(nullptr); ez::command_observer_set(nullptr);
   ez::drive_stop(&chassis);
+  reverse_right_diag_cancel_capture(); // Teardown after the existing drive stop.
+  ez::native_odom_exit_observer_set(nullptr);
   stop_all_mechanisms();
   if (active) { fault = "competition mode changed"; chassis.pid_print_toggle(print_before); }
   active = waiting = busy = pending = false;

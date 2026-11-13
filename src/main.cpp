@@ -6,6 +6,7 @@
 #include "liblvgl/llemu.hpp" // Explicit LCD callback declarations for editor and build.
 
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <atomic>
 
@@ -18,6 +19,8 @@
 #include "motion_exit_trace.hpp"
 #include "path_motion_trace.hpp"
 #include "subsystems.hpp"
+#include "preload_motion.hpp"
+
 #include "pose_recorder.hpp"
 #include "route_config.hpp"
 
@@ -31,15 +34,17 @@ constexpr int IMU_PORT = 20;
 constexpr double HORIZONTAL_TRACKER_DIAMETER_IN = 2.000;
 constexpr double VERTICAL_TRACKER_DIAMETER_IN = 1.9585;
 // EZ applies the side sign: BACK P5 is negative; RIGHT P7 is positive.
-constexpr double HORIZONTAL_TRACKER_OFFSET_IN = 1.400;
-constexpr double VERTICAL_TRACKER_OFFSET_IN = 0.800;
+
+
+constexpr double HORIZONTAL_TRACKER_OFFSET_IN = 2.000;
+constexpr double VERTICAL_TRACKER_OFFSET_IN = 0.125;
 constexpr double TRACKER_GEAR_RATIO = 1.0;
 
 constexpr double TURN_MULTIPLIER = 1.30;
 constexpr double DRIVER_ACTIVE_BRAKE_KP = 3.0;
 constexpr int DRIVER_DEADZONE = 5;
 constexpr int DRIVER_LOOP_MS = 10;
-constexpr int ODOM_DISPLAY_REFRESH_MS = 50;
+constexpr int ODOM_DISPLAY_REFRESH_MS = 100;
 std::atomic<const char*> development_mode{"DRIVER"};
 
 bool imu_calibrated = false;
@@ -53,7 +58,8 @@ void restore_driver_brakes() {
 pros::Mutex odom_display_mutex;
 // The selector and live pose display share the Brain screen.
 // These flags decide which one may draw while the mutex protects a screen update.
-bool odom_display_frozen = false;
+bool odom_display_frozen = true;
+bool odom_display_redraw = true; // Protected by odom_display_mutex.
 bool auton_selector_screen_active = false; // Protected by odom_display_mutex.
 
 // Selector and odometry share the existing screen-ownership lock.
@@ -108,45 +114,62 @@ void driver_arcade_control(int forward_input, int turn_input) {
   chassis.opcontrol_joystick_threshold_iterate(left_output, right_output);
 }
 
-void clear_brain_lines() {
-  for (int line = 0; line < 8; ++line)
-    pros::lcd::set_text(line, "");
-}
-
-// Hand screen ownership back to the existing live odometry task.
-
+// Hand screen ownership to the single recovery-safe coordinate task.
 void show_live_odometry() {
-  // Recovery mode: direct-screen coordinates are handled in opcontrol().
-  if (!pros::lcd::is_initialized()) return;
-
   odom_display_mutex.take();
   auton_selector_screen_active = false;
-  clear_brain_lines();
+  odom_display_redraw = true;
   odom_display_frozen = false;
   odom_diagnostic_screen_release();
   odom_display_mutex.give();
 }
 
+// Same green coordinate layout used in driver control and autonomous.
+// Called only by odom_display_task while holding the screen-ownership mutex.
 void display_odom_pose() {
-  pros::lcd::print(4, "LIFT POSITION: %.1f deg", lift_position_deg());
-  if (!imu_calibrated) {
-    pros::lcd::set_text(0, "IMU CALIBRATION FAILED");
-    return;
+  if (odom_display_redraw) {
+    pros::screen::set_pen(0x0000FF00);
+    pros::screen::fill_rect(0, 0, 479, 239);
+    odom_display_redraw = false;
   }
+  pros::screen::set_eraser(0x0000FF00);
+  pros::screen::set_pen(0x00000000);
+  pros::screen::print(pros::E_TEXT_MEDIUM, 1, "2474V VALKYRIE");
 
   const auto pose = nav_pose_get();
-  pros::lcd::set_text(0, "2474V");
-  pros::lcd::print(1, "X:     %7.2f in", pose.x);
-  pros::lcd::print(2, "Y:     %7.2f in", pose.y);
-  pros::lcd::print(3, "HEADING: %7.2f deg", pose.theta);  // FRONT heading.
-  pros::lcd::print(5, "Mode: %s", development_mode.load());
+  pros::screen::print(pros::E_TEXT_MEDIUM, 2,
+                      "X:       %8.2f in   ", pose.x);
+  pros::screen::print(pros::E_TEXT_MEDIUM, 3,
+                      "Y:       %8.2f in   ", pose.y);
+  pros::screen::print(pros::E_TEXT_MEDIUM, 4,
+                      "HEADING:  %8.2f deg ", pose.theta);
+  const double lift_deg = lift_position_deg();
+  if (std::isfinite(lift_deg)) {
+    pros::screen::print(pros::E_TEXT_MEDIUM, 5,
+                        "LIFT: %8.1f deg     ", lift_deg);
+  } else {
+    pros::screen::print(pros::E_TEXT_MEDIUM, 5,
+                        "LIFT: SENSOR ERROR      ");
+  }
+  pros::screen::print(pros::E_TEXT_MEDIUM, 6,
+                      "IMU: %s             ",
+                      imu_calibrated ? "CALIBRATED" : "FAILED");
+  if (pros::competition::is_autonomous()) {
+    pros::screen::print(pros::E_TEXT_MEDIUM, 7,
+                        "AUTON: %-16s", development_mode.load());
+  } else {
+    pros::screen::print(pros::E_TEXT_MEDIUM, 7,
+                        "DRIVER CONTROL          ");
+  }
 }
 
 void odom_display_task() {
   while (true) {
-    anti_tip::update(); // Read-only, even when another Brain page owns the screen.
     odom_display_mutex.take();
-    if (NAV_DIAGNOSTICS && !pros::competition::is_disabled() &&
+    // Never compete with an initialized legacy LCD/LVGL screen or a diagnostic
+    // that has explicitly acquired screen ownership.
+    if (!pros::competition::is_disabled() &&
+        !pros::lcd::is_initialized() && !auton_selector_screen_active &&
         !odom_display_frozen && !odom_diagnostic_screen_is_active())
       display_odom_pose();
     odom_display_mutex.give();
@@ -165,7 +188,7 @@ void odom_display_freeze() {
 // ----- Drivetrain configuration -----
 // This is the shared EZ-Template drive used by both driver control and autonomous.
 ez::Drive chassis(
-    {-1, 4},        // LEFT viewed facing FRONT; positive output moves FRONT-first.
+    {-6, 4},        // LEFT viewed facing FRONT; positive output moves FRONT-first.
     {-3 , 2},       // RIGHT viewed facing FRONT; positive output moves FRONT-first.
     IMU_PORT,         // Real inertial sensor on Smart Port 20.
     2.75,             // Drive-wheel diameter in inches.
@@ -288,6 +311,12 @@ void initialize() {
       pros::E_TEXT_MEDIUM, 5, "DRIVER MODE TEST");
 
   master.rumble(".");
+
+  // Start once, after startup screen writes. Remain frozen until a mode begins.
+  // Independent of the competition callbacks, including blocking navigation.
+  static pros::Task live_display(odom_display_task, TASK_PRIORITY_MIN,
+                                 TASK_STACK_DEPTH_DEFAULT, "Live coordinates");
+  (void)live_display;
 }
 
 
@@ -306,8 +335,10 @@ void competition_initialize() {
 // ----- Autonomous mode selection -----
 // Change these switches to choose one test mode; all false uses the Brain selector.
 // Development bypasses selector dispatch; the installed Brain selector is for finalized routes.
+
+
 constexpr bool RUN_DEV_TEST = false;
-constexpr DevTest ACTIVE_DEV_TEST = DevTest::TURN_90;
+constexpr DevTest ACTIVE_DEV_TEST = DevTest::GOTO_POSE;
 constexpr bool RUN_CUSTOM_AUTON_TEST = true;
 constexpr bool RUN_ROUTE_SEGMENT_TEST = false;
 constexpr auton::RouteSegmentTest ACTIVE_ROUTE_SEGMENT = auton::RouteSegmentTest::SNAPSHOT;
@@ -316,23 +347,22 @@ static_assert(static_cast<int>(RUN_DEV_TEST)+static_cast<int>(RUN_CUSTOM_AUTON_T
 static_assert(!(RUN_DEV_TEST && RUN_CUSTOM_AUTON_TEST), "Select only one development mode");
 
 void custom_auton_test() {
-  // Temporarily isolate geometry measurement; the diagnostic initializes its pose.
-  // No toggle or other mechanism commands in this custom test.
-nav_set_start(0, 0, 0);
-toggle_run();
-pros::delay(395);
-toggle_stop();
+  const unsigned began = pros::millis();
+  bool ok = claw_open();  // Physically CLOSE claw.
+  // if (ok) ok = pulse_toggle();  // Existing 395 ms pulse.
+  // if (ok) ok = lift_boomerang_to(514, 19.42, 7.58, 54.14, 40);
+  // if (ok) ok = preload_lower_for_release(32, 2000);
+  // if (ok) ok = claw_close();  // Physically OPEN claw.
+  // preload_auton_finish_log(began, ok);
+    nav_go_to_pose(19.94, 6.93, 56.83, 110);
 
+
+
+
+  
 }
-
-
 void autonomous() {
-  pros::screen::set_eraser(0x00000000);
-  pros::screen::erase();
-  pros::screen::set_pen(0x00FFFFFF);
-
-  pros::screen::print(
-      pros::E_TEXT_MEDIUM, 1, "AUTON ENTERED");
+  std::printf("AUTON ENTERED\n");
                 
   ez::drive_stop(&chassis);
   ez::autonomous_begin();  // ----- Autonomous dispatch -----
@@ -346,6 +376,18 @@ void autonomous() {
   struct Cleanup {
     ~Cleanup() { nav_cancel_sequence(); stop_all_mechanisms(); }
   } cleanup;
+  if (RUN_CUSTOM_AUTON_TEST) {
+
+    std::printf("CUSTOM TEST RUNNING\n");
+    nav_set_start(0, 0, 0);  // Drivetrain reference only; never P16.
+    custom_auton_test();
+    const auto pose = nav_pose_get();
+    std::printf("CUSTOM TEST FINISHED: X=%.2f Y=%.2f HEADING=%.2f\n",
+                pose.x, pose.y, pose.theta);
+
+    return;
+}
+
   auton::preflight(false); // Optional mechanism/distance snapshot never blocks unrelated tests.
 
   if (RUN_ROUTE_SEGMENT_TEST) {
@@ -358,33 +400,6 @@ void autonomous() {
     run_dev_test(ACTIVE_DEV_TEST);
     return;
   }
-
-  if (RUN_CUSTOM_AUTON_TEST) {
-
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 2, "90 DEG TEST RUNNING");
-
-    custom_auton_test();
-
-    const auto pose = nav_pose_get();
-
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 2, "90 DEG TEST FINISHED");
-
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 3,
-        "X: %.2f in", pose.x);
-
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 4,
-        "Y: %.2f in", pose.y);
-
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 5,
-        "HEADING: %.2f deg", pose.theta);
-
-    return;
-}
 
   nav_print_sensor_health(); // Informational, not a selector gate.
   ez::as::auton_selector.selected_auton_call();
@@ -407,20 +422,6 @@ driver_coast_mode = false;
 telemetry_reset();
 mechanisms_preflight(false, false, false);
 
-
-    // Fill the Brain's display area with green.
-  // Fill the Brain's display area with green.
-  pros::screen::set_pen(0x0000FF00);
-  pros::screen::fill_rect(0, 0, 479, 239);
-
-  // Keep green background with black text.
-  pros::screen::set_eraser(0x0000FF00);
-  pros::screen::set_pen(0x00000000);
-
-pros::screen::print(
-    pros::E_TEXT_MEDIUM, 1, "2474V VALKYRIE");
-
-int display_tick = 0;
 
 while (true) {
     if (pros::competition::is_disabled() ||
@@ -487,49 +488,6 @@ if (!mechanism_config::ENABLE_LIFT_CALIBRATION_MODE &&
 
 
 telemetry_update(master);
-
-// Refresh the live coordinates every ~100 ms.
-if (++display_tick >= 10) {
-  display_tick = 0;
-
-  const auto pose = nav_pose_get();
-
-  pros::screen::print(
-      pros::E_TEXT_MEDIUM, 2,
-      "X:       %8.2f in   ", pose.x);
-
-  pros::screen::print(
-      pros::E_TEXT_MEDIUM, 3,
-      "Y:       %8.2f in   ", pose.y);
-
-  pros::screen::print(
-      pros::E_TEXT_MEDIUM, 4,
-      "HEADING:  %8.2f deg ", pose.theta);
-
-
-  const double lift_deg = lift_position_deg();
-
-  if (std::isfinite(lift_deg)) {
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 5,
-        "LIFT: %8.1f deg     ", lift_deg);
-  } else {
-    pros::screen::print(
-        pros::E_TEXT_MEDIUM, 5,
-        "LIFT: SENSOR ERROR      ");
-  }
-
-  // Display whether IMU calibration succeeded.
-pros::screen::print(
-    pros::E_TEXT_MEDIUM, 6,
-    "IMU: %s             ",
-    imu_calibrated ? "CALIBRATED" : "FAILED");
-
-// Existing driver-control label.
-pros::screen::print(
-    pros::E_TEXT_MEDIUM, 7,
-    "DRIVER CONTROL");
-}
 
 pros::delay(DRIVER_LOOP_MS);
 }   

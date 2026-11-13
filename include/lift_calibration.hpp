@@ -19,7 +19,7 @@ inline constexpr double MAX_SAFE_DEG = 3000;
 inline constexpr double INTAKE_DEG = 38.5;
 
 // Alliance Goal scoring positions.
-inline constexpr double ALLIANCE_GOAL_1_DEG = 250;
+inline constexpr double ALLIANCE_GOAL_1_DEG = 32.1;
 inline constexpr double ALLIANCE_GOAL_2_DEG = NAN;
 
 // Neutral Goal scoring positions.

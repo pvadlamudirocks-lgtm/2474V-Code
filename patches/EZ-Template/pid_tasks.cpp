@@ -17,14 +17,31 @@ std::atomic<ez::CommandObserver> command_observer{nullptr};
 std::atomic<ez::DriveTelemetryObserver> drive_telemetry_observer{nullptr};
 pros::Mutex navigation_mutex; // Short controller/vector mutation serialization only.
 std::atomic<bool> emergency_stop{false};
+std::atomic<ez::Drive*> turn_trace_drive{nullptr};
+ez::TurnOutputTrace turn_trace;
+void trace_zero(ez::Drive* drive, const char* reason) {
+  if (turn_trace_drive.load() != drive) return;
+  ++turn_trace.zero_count;
+  turn_trace.command_left = turn_trace.command_right = 0;
+  turn_trace.mode = static_cast<int>(drive->drive_mode_get());
+  if (turn_trace.zero_count == 1) turn_trace.zero_reason = reason;
+}
 std::atomic<ez::Drive*> geometry_drive{nullptr};
 geometry_turn::Deadline geometry_deadline; // Access only under navigation_mutex.
+ez::TurnSensorCheck geometry_sensors_ok = nullptr; // Same mutex; opt-in only.
+int geometry_max_power = 127; // Optional diagnostic cap, under navigation_mutex.
 std::atomic<geometry_turn::Result> geometry_result{geometry_turn::Result::Idle};
 bool geometry_tick(ez::Drive* drive) {
   if (geometry_drive.load() != drive) return false;
   geometry_deadline.update(pros::millis(), ez::autonomous_cancelled());
+  if (geometry_deadline.result == geometry_turn::Result::Running && geometry_sensors_ok) {
+    const bool healthy = geometry_sensors_ok();
+    // Recheck elapsed time/cancellation after device reads, before any motor output.
+    geometry_deadline.update(pros::millis(), ez::autonomous_cancelled(), healthy);
+  }
   if (!geometry_deadline.must_stop()) return false;
   drive->drive_set(0,0); // Existing controller owner; no logging or outer wait.
+  trace_zero(drive, "DEADLINE_OR_SENSOR_OR_CANCEL");
   geometry_result.store(geometry_deadline.result); // Published after stop command.
   return true; // Stay stopped until explicit cleanup disarms this test.
 }
@@ -37,18 +54,24 @@ void ez::navigation_unlock() { navigation_mutex.give(); }
 void ez::drive_stop(Drive* drive) {
   navigation_lock();
   drive->drive_set(0,0);
+  trace_zero(drive, "EXPLICIT_STOP");
+  if (turn_trace_drive.load() == drive) turn_trace_drive.store(nullptr);
   if (geometry_drive.load() == drive) {
     geometry_deadline.finish(pros::millis(), autonomous_cancelled());
     geometry_result.store(geometry_deadline.result);
     geometry_drive.store(nullptr);
+    geometry_sensors_ok = nullptr;
   }
   navigation_unlock();
 }
-bool ez::geometry_turn_deadline_arm(Drive* drive) {
+bool ez::geometry_turn_deadline_arm(Drive* drive, TurnSensorCheck sensors_ok, int max_power) {
   navigation_lock();
-  const bool accepted = drive && !geometry_drive.load() && !autonomous_cancelled() &&
+  const bool accepted = drive && max_power >= 1 && max_power <= 127 &&
+                        !geometry_drive.load() && !autonomous_cancelled() &&
                         drive->drive_mode_get() == DISABLE;
   if (accepted) {
+    geometry_sensors_ok = sensors_ok;
+    geometry_max_power = max_power;
     geometry_deadline.arm(pros::millis(), geometry_turn::maximum_powered_ms);
     geometry_result.store(geometry_turn::Result::Running);
     geometry_drive.store(drive);
@@ -56,11 +79,12 @@ bool ez::geometry_turn_deadline_arm(Drive* drive) {
   navigation_unlock();
   return accepted;
 }
+bool ez::geometry_turn_deadline_active(Drive* drive) { return geometry_drive.load() == drive; }
 geometry_turn::Result ez::geometry_turn_deadline_result() { return geometry_result.load(); }
 bool ez::geometry_turn_deadline_stopped(Drive* drive) {
   const auto result = geometry_result.load();
   return geometry_drive.load() == drive &&
-         (result == geometry_turn::Result::Timeout || result == geometry_turn::Result::Interrupted);
+         (result == geometry_turn::Result::Timeout || result == geometry_turn::Result::Interrupted || result == geometry_turn::Result::SensorFault);
 }
 void ez::autonomous_begin() { emergency_stop.store(false); }
 void ez::autonomous_emergency_stop() { emergency_stop.store(true); }
@@ -75,14 +99,14 @@ using namespace ez;
 void Drive::ez_auto_task() {
   while (true) {
     // Basic competition/E-stop handling runs in this existing motor owner.
-    // The geometry test alone can arm a deadline; unarmed behavior is unchanged.
+    // Explicit turn diagnostics alone can arm a deadline; unarmed behavior is unchanged.
     navigation_lock();
-    if (!geometry_tick(this) && (drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) drive_set(0,0);
+    if (!geometry_tick(this) && (drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) { drive_set(0,0); trace_zero(this, "AUTONOMOUS_CANCELLED"); }
     navigation_unlock();
     ez_tracking_task();
     navigation_lock();
     if (geometry_tick(this)) {}
-    else if((drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) drive_set(0,0);
+    else if((drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) { drive_set(0,0); trace_zero(this, "AUTONOMOUS_CANCELLED"); }
     else switch (drive_mode_get()) {
       case DRIVE: drive_pid_task(); break;
       case TURN ... TURN_TO_POINT: turn_pid_task(); break;
@@ -93,7 +117,7 @@ void Drive::ez_auto_task() {
       default: break;
     }
     // Catch a mode change or B press that occurred during a native calculation.
-    if (!geometry_tick(this) && (drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) drive_set(0,0);
+    if (!geometry_tick(this) && (drive_mode_get()!=DISABLE || pros::competition::is_autonomous()) && autonomous_cancelled()) { drive_set(0,0); trace_zero(this, "AUTONOMOUS_CANCELLED"); }
     navigation_unlock();
     util::AUTON_RAN = drive_mode_get() != DISABLE ? true : false;
     pros::delay(ez::util::DELAY_TIME);
@@ -164,6 +188,7 @@ void Drive::turn_pid_task() {
 
   // Clip gyroPID to max speed
   double gyro_out = util::clamp(turnPID.output, slew_turn.output(), -slew_turn.output());
+  const double trace_after_slew = gyro_out;
 
   // Clip the speed of the turn when the robot is within StartI, only do this when target is larger then StartI
   if (turnPID.constants.ki != 0 && (fabs(turnPID.target_get()) > turnPID.constants.start_i && fabs(turnPID.error) < turnPID.constants.start_i)) {
@@ -171,9 +196,28 @@ void Drive::turn_pid_task() {
       gyro_out = util::clamp(gyro_out, pid_turn_min_get(), -pid_turn_min_get());
   }
 
+  const double trace_before_cap = gyro_out;
+  // An explicitly armed diagnostic cap also bounds slew/minimum-turn output.
+  if (geometry_drive.load() == this)
+    gyro_out = util::clamp(gyro_out, geometry_max_power, -geometry_max_power);
   // Set motors
   if (drive_toggle)
     private_drive_set(gyro_out, -gyro_out);
+  if (turn_trace_drive.load() == this) {
+    turn_trace.sampled_ms = pros::millis();
+    turn_trace.pid = turnPID.output;
+    turn_trace.slew_limit = slew_turn.output();
+    turn_trace.after_slew = trace_after_slew;
+    turn_trace.before_cap = trace_before_cap;
+    turn_trace.turn_left = static_cast<int>(gyro_out);
+    turn_trace.turn_right = static_cast<int>(-gyro_out);
+    turn_trace.drive_enabled = drive_toggle;
+    turn_trace.mode = static_cast<int>(drive_mode_get());
+    if (drive_toggle) {
+      turn_trace.command_left = turn_trace.turn_left;
+      turn_trace.command_right = turn_trace.turn_right;
+    }
+  }
   if (drive_toggle) if (auto observer = command_observer.load()) observer(this, gyro_out, -gyro_out);
 }
 
@@ -243,7 +287,8 @@ void Drive::ptp_task() {
   xy_out = util::clamp(xy_out, max_slew_out);
   // double scale = cos(util::to_rad(current_a_odomPID.error)) / odom_turn_bias_amount;
   double scale = 1.0 - ((1.0 - cos(util::to_rad(current_a_odomPID.error))) / odom_turn_bias_amount);  // 1 - ((1-0.7)/0.75)
-  if (odom_turn_bias_enabled())
+  const bool bias_enabled = odom_turn_bias_enabled();
+  if (bias_enabled)
     xy_out *= scale;
   double a_out = current_a_odomPID.output;
   // a_out = util::clamp(a_out, max_slew_out);
@@ -283,7 +328,8 @@ void Drive::ptp_task() {
   // write above are unchanged. A null callback has no capture overhead.
   if (auto hook = path_trace_hook.load()) {
     hook(this, {temp_target, max_slew_out, scale, xy_out, a_out, l_out, r_out,
-                dir, flipped, drive_toggle});
+                dir, flipped, drive_toggle, a_target, odom_target.x, odom_target.y,
+                odom_target.theta, bias_enabled});
   }
 
   // This is for wait_until
@@ -338,3 +384,36 @@ void Drive::pp_task() {
 }
 
 
+
+void ez::turn_output_trace_begin(Drive* drive) {
+  navigation_lock();
+  turn_trace = TurnOutputTrace{};
+  turn_trace_drive.store(drive);
+  navigation_unlock();
+}
+void ez::turn_output_trace_end() {
+  navigation_lock();
+  turn_trace_drive.store(nullptr);
+  navigation_unlock();
+}
+ez::TurnOutputTrace ez::turn_output_trace_get() {
+  navigation_lock();
+  const auto copy = turn_trace;
+  navigation_unlock();
+  return copy;
+}
+void ez::turn_output_trace_exit(const PID* pid, const char* branch, double secondary, int k, int m, int l) {
+  auto* drive = turn_trace_drive.load();
+  if (!drive || pid != &drive->turnPID) return;
+  navigation_lock();
+  if (turn_trace_drive.load() == drive) {
+    turn_trace.exit_branch = branch;
+    turn_trace.exit_error = pid->error;
+    turn_trace.exit_derivative = pid->derivative;
+    turn_trace.exit_secondary = secondary;
+    turn_trace.exit_k = k;
+    turn_trace.exit_m = m;
+    turn_trace.exit_l = l;
+  }
+  navigation_unlock();
+}

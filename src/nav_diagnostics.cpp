@@ -15,21 +15,49 @@ void latch_sensor_fault() {
 }
 bool nav_sensor_fault_latched() { return sensor_fault.load(); }
 
-// ----- Navigation health -----
-// Silent checks are used during motion; the printed snapshot below is for setup.
-bool nav_sensors_ready() {
-  auto* h=chassis.odom_tracker_back;
-  auto* v=chassis.odom_tracker_right;
-  const auto p=nav_pose_get();
-  const bool ready = chassis.imu.is_installed() && chassis.imu.get_status()!=pros::ImuStatus::error &&
-      !chassis.imu.is_calibrating() && std::isfinite(chassis.imu.get_rotation()) &&
-      h && v && h->smart_encoder.is_installed() && v->smart_encoder.is_installed() &&
-      h->smart_encoder.get_position()!=PROS_ERR && v->smart_encoder.get_position()!=PROS_ERR &&
-      std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.theta);
-  if (!ready) latch_sensor_fault();
-  return ready; // Historical fault latch is telemetry only, never a movement gate.
+// Shared passive device selection: do not infer physical placement or alter geometry.
+ez::tracking_wheel* nav_diagnostic_tracker(unsigned index) {
+  return index == 0 ? chassis.odom_tracker_front :
+         index == 1 ? chassis.odom_tracker_left : nullptr;
 }
-
+NavTrackerSample nav_read_tracker(unsigned index) {
+  NavTrackerSample s{index == 0 ? "HORIZONTAL FRONT" : "VERTICAL LEFT",
+                      index == 0 ? 5 : 7, 0, false, false, false,
+                      NAN, NAN, NAN, 0};
+  auto* tracker = nav_diagnostic_tracker(index);
+  if (!tracker) { s.error = ENODEV; return s; }
+  s.actual_port = tracker->smart_encoder.get_port();
+  s.configuration_ok = s.actual_port == s.expected_port;
+  s.installed = tracker->smart_encoder.is_installed();
+  if (!s.installed) { s.error = ENODEV; return s; }
+  errno = 0;
+  const auto raw = tracker->smart_encoder.get_position();
+  s.error = errno;
+  s.ticks_per_inch = tracker->ticks_per_inch();
+  const bool readable = raw != PROS_ERR && std::isfinite(static_cast<double>(raw));
+  if (readable) s.raw_cd = raw;
+  s.valid = s.configuration_ok && readable && std::isfinite(s.ticks_per_inch) &&
+            s.ticks_per_inch > 0;
+  if (s.valid) s.distance_in = s.raw_cd / s.ticks_per_inch;
+  return s;
+}
+namespace {
+bool sensor_value_ok(double value) {
+  return std::isfinite(value) && value != PROS_ERR && value != PROS_ERR_F;
+}
+}
+// ----- Navigation health -----
+// Read-only, silent; retained diagnostic-history behavior, no motion commands.
+bool nav_sensors_ready() {
+  const auto h = nav_read_tracker(0), v = nav_read_tracker(1);
+  const auto p = nav_pose_get();
+  const bool ready = chassis.imu.get_port() == 20 && chassis.imu.is_installed() &&
+      chassis.imu.get_status() != pros::ImuStatus::error && !chassis.imu.is_calibrating() &&
+      sensor_value_ok(chassis.imu.get_rotation()) && sensor_value_ok(chassis.imu.get_heading()) &&
+      h.valid && v.valid && sensor_value_ok(p.x) && sensor_value_ok(p.y) && sensor_value_ok(p.theta);
+  if (!ready) latch_sensor_fault();
+  return ready;
+}
 namespace {
 struct Result {
   ez::pose actual;
@@ -187,98 +215,80 @@ void nav_manual_odom_sample(bool enabled) {
   const unsigned now = pros::millis();
   if (sampled && now - last_ms < 250) return;
   last_ms = now; sampled = true; // Rate-limit failures as well as healthy samples.
-  ez::tracking_wheel* trackers[] = {chassis.odom_tracker_back, chassis.odom_tracker_right};
-  const char* labels[] = {"P5 HORIZONTAL BACK", "P7 VERTICAL RIGHT"};
-  for (int i = 0; i < 2; ++i) {
-    auto* t = trackers[i];
-    errno = 0;
-    const auto raw = t ? t->smart_encoder.get_position() : PROS_ERR;
-    const int error = t ? errno : ENODEV; // Capture immediately, before another API call.
-    const double tpi = t ? t->ticks_per_inch() : NAN;
-    const bool valid = raw != PROS_ERR && std::isfinite(tpi) && tpi > 0;
-    if (!valid) {
+  for (unsigned i = 0; i < 2; ++i) {
+    const auto t = nav_read_tracker(i);
+    if (!t.valid) {
       latch_sensor_fault();
       if (!seen_invalid[i]) { seen_invalid[i] = true; first_invalid[i] = now; }
     }
-    // Convert the SAME validated reading; do not reread via tracking_wheel::get().
-    const double distance = valid ? static_cast<double>(raw) / tpi : NAN;
-    const double delta = valid && previous_valid[i] ? static_cast<double>(raw) - previous[i] : NAN;
-    std::printf("ODOM ms=%u %s raw_cd=%ld valid=%d errno=%d d_raw_cd=%.0f distance_in=%.6f d_in=%.6f first_invalid_seen=%d first_invalid_ms=%u\n",
-        now, labels[i], static_cast<long>(raw), valid, error, delta, distance,
-        valid ? delta / tpi : NAN, seen_invalid[i], first_invalid[i]);
-    previous_valid[i] = valid;
-    if (valid) previous[i] = raw;
+    const double delta = t.valid && previous_valid[i] ? t.raw_cd - previous[i] : NAN;
+    std::printf("ODOM ms=%u %s expected=P%d actual=P%d attached=%d installed=%d config_ok=%d raw_cd=%.0f valid=%d errno=%d d_raw_cd=%.0f distance_in=%.6f d_in=%.6f first_invalid_seen=%d first_invalid_ms=%u\n",
+        now, t.label, t.expected_port, t.actual_port, nav_diagnostic_tracker(i) != nullptr,
+        t.installed, t.configuration_ok, t.raw_cd, t.valid, t.error, delta, t.distance_in,
+        t.valid ? delta / t.ticks_per_inch : NAN, seen_invalid[i], first_invalid[i]);
+    previous_valid[i] = t.valid;
+    if (t.valid) previous[i] = t.raw_cd;
   }
   const auto status = chassis.imu.get_status();
   const bool calibrating = chassis.imu.is_calibrating();
   errno = 0;
   const double heading = chassis.imu.get_heading();
   const int error = errno;
-  const bool imu_valid = status != pros::ImuStatus::error && !calibrating && std::isfinite(heading);
+  const bool imu_installed = chassis.imu.is_installed();
+  const int imu_port = chassis.imu.get_port();
+  const bool imu_valid = imu_port == 20 && imu_installed && status != pros::ImuStatus::error && !calibrating && sensor_value_ok(heading);
   if (!imu_valid) {
     latch_sensor_fault();
     if (!seen_invalid[2]) { seen_invalid[2] = true; first_invalid[2] = now; }
   }
   const auto internal = chassis.odom_pose_get();
   const auto public_pose = nav_internal_to_game_pose(internal);
-  if (!finite_pose(internal)) latch_sensor_fault();
-  std::printf("ODOM ms=%u P20 heading=%.6f valid=%d status=%u calibrating=%d errno=%d first_invalid_seen=%d first_invalid_ms=%u | EZ x=%.6f y=%.6f h=%.6f | PUBLIC x=%.6f y=%.6f h=%.6f | fault_latched=%d first_fault_ms=%u\n",
-      now, heading, imu_valid, static_cast<unsigned>(status), calibrating, error,
+  const bool pose_valid = sensor_value_ok(internal.x) && sensor_value_ok(internal.y) && sensor_value_ok(internal.theta);
+  if (!pose_valid) latch_sensor_fault();
+  std::printf("ODOM ms=%u IMU expected=P20 actual=P%d installed=%d config_ok=%d heading=%.6f valid=%d status=%u calibrating=%d errno=%d first_invalid_seen=%d first_invalid_ms=%u | EZ x=%.6f y=%.6f h=%.6f | PUBLIC x=%.6f y=%.6f h=%.6f pose_valid=%d | fault_latched=%d first_fault_ms=%u\n",
+      now, imu_port, imu_installed, imu_port == 20, imu_valid ? heading : NAN, imu_valid, static_cast<unsigned>(status), calibrating, error,
       seen_invalid[2], first_invalid[2], internal.x, internal.y, internal.theta,
-      public_pose.x, public_pose.y, public_pose.theta, sensor_fault.load(), first_fault_ms.load());
+      public_pose.x, public_pose.y, public_pose.theta, pose_valid, sensor_fault.load(), first_fault_ms.load());
   std::fflush(stdout);
 }
 namespace {
-bool sensor_value_ok(double value) {
-  return std::isfinite(value) && value != PROS_ERR && value != PROS_ERR_F;
-}
-bool print_tracker(ez::tracking_wheel* tracker, const char* label, const char* location) {
-  const bool installed = tracker && tracker->smart_encoder.is_installed();
-  std::printf("\n%s\ninstalled: %s\nconfigured location: %s\n", label,
-              installed ? "YES" : "NO -- SENSOR MISSING", location);
-  if (!installed) return false;
-  const double raw = tracker->smart_encoder.get_position();
-  if (!sensor_value_ok(raw)) {
-    std::printf("raw position: ERROR -- UNREADABLE\n");
-    return false;
-  }
-  std::printf("raw position: %.0f centidegrees (configured reversal included)\n", raw);
-  return true;
+bool print_tracker(unsigned index) {
+  const auto t = nav_read_tracker(index);
+  std::printf("%s expected=P%d actual=P%d attached=%d installed=%d config_ok=%d raw_cd=%.0f distance_in=%.6f valid=%d errno=%d\n",
+      t.label, t.expected_port, t.actual_port, nav_diagnostic_tracker(index) != nullptr,
+      t.installed, t.configuration_ok, t.raw_cd, t.distance_in, t.valid, t.error);
+  if (!t.configuration_ok) std::printf("TRACKER CONFIGURATION MISMATCH: expected attached %s P%d\n", t.label, t.expected_port);
+  else if (!t.installed) std::printf("TRACKER MISSING: P%d\n", t.actual_port);
+  else if (!t.valid) std::printf("TRACKER INVALID: unreadable position or scale\n");
+  return t.valid;
 }
 }
-
 bool nav_print_sensor_health() {
-  std::printf("\n================================\n2474V SENSOR HEALTH\n================================\n");
-  const bool back = print_tracker(chassis.odom_tracker_back, "P5 PERPENDICULAR TRACKER", "BACK");
-  const bool right = print_tracker(chassis.odom_tracker_right, "P7 PARALLEL TRACKER", "RIGHT");
+  std::printf("\n2474V PASSIVE SENSOR HEALTH (no reset or motor commands)\n");
+  const bool horizontal = print_tracker(0), vertical = print_tracker(1);
+  const int port = chassis.imu.get_port();
   const bool installed = chassis.imu.is_installed();
-  std::printf("\nP20 IMU\ninstalled: %s\n", installed ? "YES" : "NO -- SENSOR MISSING");
-  bool ready = false;
-  if (installed) {
-    const auto status = chassis.imu.get_status();
-    if (status == pros::ImuStatus::error) {
-      std::printf("calibrating: UNKNOWN -- STATUS ERROR\n");
-    } else {
-      const bool calibrating = chassis.imu.is_calibrating();
-      std::printf("calibrating: %s\n", calibrating ? "YES" : "NO");
-      if (!calibrating) {
-        const double heading = chassis.imu.get_heading();
-        const double rotation = chassis.imu.get_rotation();
-        ready = sensor_value_ok(heading) && sensor_value_ok(rotation);
-        if (ready) std::printf("heading: %.3f\nrotation: %.3f\n", heading, rotation);
-        else std::printf("heading/rotation: ERROR -- UNREADABLE\n");
-      } else std::printf("heading/rotation: UNAVAILABLE DURING CALIBRATION\n");
-    }
-  }
-  std::printf("================================\n");
-  std::fflush(stdout);
-  if (!(back && right && ready)) latch_sensor_fault();
-  const bool navigation_ready = nav_sensors_ready();
+  const auto status = chassis.imu.get_status();
+  const bool calibrating = chassis.imu.is_calibrating();
+  errno = 0;
+  const double heading = chassis.imu.get_heading(), rotation = chassis.imu.get_rotation();
+  const int error = errno;
+  const bool imu_valid = port == 20 && installed && status != pros::ImuStatus::error &&
+      !calibrating && sensor_value_ok(heading) && sensor_value_ok(rotation);
+  std::printf("IMU expected=P20 actual=P%d installed=%d config_ok=%d status=%u calibrating=%d heading=%.6f rotation=%.6f valid=%d errno=%d\n",
+      port, installed, port == 20, static_cast<unsigned>(status), calibrating,
+      imu_valid ? heading : NAN, imu_valid ? rotation : NAN, imu_valid, error);
+  const auto p = nav_pose_get();
+  const bool pose_valid = sensor_value_ok(p.x) && sensor_value_ok(p.y) && sensor_value_ok(p.theta);
+  std::printf("CURRENT POSE X=%.6f Y=%.6f heading=%.6f pose_valid=%d (not geometry qualification)\n",
+      p.x, p.y, p.theta, pose_valid);
+  const bool ready = horizontal && vertical && imu_valid && pose_valid;
+  if (!ready) latch_sensor_fault();
   std::printf("NAV historical_fault=%d first_fault_ms=%u current_valid=%d (report only)\n",
-      sensor_fault.load(), first_fault_ms.load(), navigation_ready);
-  return navigation_ready;
+      sensor_fault.load(), first_fault_ms.load(), ready);
+  std::fflush(stdout);
+  return ready;
 }
-
 void nav_print_snapshot(const char* label) {
   const auto p = chassis.odom_pose_get();
   std::printf("\n=== %s ms=%lu EZ x=%.6f y=%.6f h=%.6f ===\n", label,

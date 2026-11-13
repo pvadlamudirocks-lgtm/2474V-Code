@@ -3,7 +3,13 @@
 enum class DevTest {
   SENSOR_HEALTH, START_POSE, MANUAL_ODOM, DRIVE_FORWARD_12, TURN_90,
   GOTO_Y_12, GOTO_X_12, REVERSE_12, RETURN_TO_ORIGIN, TWO_POINT,
-  SQUARE, GOTO_POSE, CHAIN_TWO_MOVE, PURE_PURSUIT_BASIC, MIRROR_MATH, STABILITY_MONITOR, FULL_SYSTEM_DIAG
+  SQUARE, GOTO_POSE, CHAIN_TWO_MOVE, PURE_PURSUIT_BASIC, MIRROR_MATH, STABILITY_MONITOR, FULL_SYSTEM_DIAG, REVERSE_RIGHT_DIAG
 };
 
 void run_dev_test(DevTest test);
+
+// Single reverse-right movement with buffered telemetry and owner-enforced deadline.
+void run_reverse_right_diag();
+
+// Lifecycle teardown for this diagnostic only; no mechanism/motor commands.
+void reverse_right_diag_cancel_capture();

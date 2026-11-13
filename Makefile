@@ -34,6 +34,8 @@ EXCLUDE_SRC_FROM_LIB+=$(foreach file, $(SRCDIR)/main,$(foreach cext,$(CEXTS),$(f
 # Mechanisms compile but require explicit initialization and commissioning gates.
 # Keep unfinished distance correction excluded from the odometry test program.
 EXCLUDE_SRCDIRS+=$(SRCDIR)/distance_correction.cpp
+# Unused legacy custom_auton runner; active custom_auton_test lives in main.cpp.
+EXCLUDE_SRCDIRS+=$(SRCDIR)/custom_auton.cpp
 
 # files that get distributed to every user (beyond your source archive) - add
 # whatever files you want here. This line is configured to add all header files

@@ -2,6 +2,7 @@
 #include "full_system_diag_limits.hpp"
 #include "main.h"
 #include "navigation.hpp"
+#include "nav_diagnostics.hpp"
 #include "autons.hpp"
 #include <atomic>
 #include <algorithm>
@@ -48,7 +49,7 @@ void diag_print(const char* format,...){
   pros::delay(20); // Report pacing only; never inside sensor acquisition.
 }
 pros::Motor& motor(unsigned i){return i<2?chassis.left_motors[i]:chassis.right_motors[i-2];}
-ez::tracking_wheel* tracker(unsigned i){return i?chassis.odom_tracker_right:chassis.odom_tracker_back;}
+ez::tracking_wheel* tracker(unsigned i){return nav_diagnostic_tracker(i);}
 bool cancelled(){return pros::competition::is_disabled() || !pros::competition::is_autonomous() ||
   (master.is_connected()==1 && master.get_digital(pros::E_CONTROLLER_DIGITAL_B)==1);}
 void note(const char* text){if(!first_failure)first_failure=text;}
@@ -57,18 +58,15 @@ Sample read_sample(){
   Sample s; s.ms=pros::millis(); s.valid=chassis.left_motors.size()==2 && chassis.right_motors.size()==2;
   errno=0; s.heading=chassis.imu.get_heading(); s.error[2]=errno;
   s.rotation=chassis.imu.get_rotation();
-  s.imu_valid = chassis.imu.is_installed() && chassis.imu.get_status()!=pros::ImuStatus::error &&
+  s.imu_valid = chassis.imu.get_port()==20 && chassis.imu.is_installed() && chassis.imu.get_status()!=pros::ImuStatus::error &&
     !chassis.imu.is_calibrating() && finite(s.heading) && finite(s.rotation);
   s.valid &= s.imu_valid;
   const auto p=nav_pose_get(); s.x=p.x;s.y=p.y;s.h=p.theta;
   s.valid &= finite(s.x)&&finite(s.y)&&finite(s.h);
   for(unsigned i=0;i<2;++i){
-    auto* t=tracker(i); errno=0;
-    const auto raw=t ? t->smart_encoder.get_position() : PROS_ERR;
-    s.error[i]=t ? errno : ENODEV; s.raw[i]=raw;
-    const double tpi=t ? t->ticks_per_inch() : NAN;
-    const bool ok=t && t->smart_encoder.is_installed() && raw!=PROS_ERR && finite(tpi) && tpi>0;
-    s.tracker_valid[i]=ok;s.valid &= ok; if(ok)s.distance[i]=static_cast<double>(raw)/tpi;
+    const auto t = nav_read_tracker(i);
+    s.error[i]=t.error; s.raw[i]=t.raw_cd; s.distance[i]=t.distance_in;
+    s.tracker_valid[i]=t.valid; s.valid &= t.valid;
   }
   if(chassis.left_motors.size()==2 && chassis.right_motors.size()==2){
     for(unsigned i=0;i<4;++i){
@@ -89,17 +87,18 @@ Sample read_sample(){
 }
 bool countdown(const char* instruction){
   diag_print("OPERATOR: %s; starts in 5 seconds. B/disable cancels.\n",instruction);
-  pros::lcd::set_text(0,"FULL SYSTEM DIAG");pros::lcd::set_text(1,instruction);
+  if (pros::lcd::is_initialized()) pros::lcd::set_text(0,"FULL SYSTEM DIAG");if (pros::lcd::is_initialized()) pros::lcd::set_text(1,instruction);
   const auto start=pros::millis();unsigned shown=0;
   while(!expired(pros::millis(),start,countdown_ms)){
     if(cancelled()){note("cancelled during countdown");return false;}
     const unsigned elapsed=pros::millis()-start;
     if(elapsed>=countdown_ms)break;
     const unsigned remaining=(countdown_ms-elapsed+999)/1000;
-    if(remaining!=shown){shown=remaining;pros::lcd::print(2,"START IN %u | B CANCEL",remaining);diag_print("COUNTDOWN %u\n",remaining);}
+    if(remaining!=shown){shown=remaining;if (pros::lcd::is_initialized()) pros::lcd::print(2,"START IN %u | B CANCEL",remaining);diag_print("COUNTDOWN %u\n",remaining);}
     pros::delay(10);
   }
-  pros::lcd::set_text(2,"GO | B/disable cancels");
+  if (pros::lcd::is_initialized()) pros::lcd::set_text(2,"GO | B/disable cancels");
+  diag_print("GO: manual capture window (no powered motion)\n");
   return !cancelled();
 }
 void dump(){
@@ -137,7 +136,7 @@ void summary(){
   diag_print("Physical angle/geometry: INCONCLUSIVE; powered motor/turn/drive/navigation: SKIPPED\n");
   diag_print("First issue: %s\n",first_failure?first_failure:"none detected; not physical qualification");
   diag_print("=== DIAGNOSTIC SUMMARY END ===\n");
-  pros::lcd::set_text(2,output_failed?"SUMMARY OUTPUT ERROR":"SUMMARY READY / PASSIVE");
+  if (pros::lcd::is_initialized()) pros::lcd::set_text(2,output_failed?"SUMMARY OUTPUT ERROR":"SUMMARY READY / PASSIVE");
 }
 }
 bool capture_window(unsigned duration){
@@ -162,9 +161,10 @@ void run_full_system_diag(){
   for(auto& status:tracker_status)status=SKIPPED;
   for(auto& seen:stage_seen)seen=false;
   struct Report {~Report(){summary();}} report;
-  odom_display_freeze();
+  if (pros::lcd::is_initialized()) odom_display_freeze();
+  nav_print_sensor_health(); // Terminal-only attachment and validity evidence.
   stage_seen[0]=true;
-  pros::lcd::set_text(0,"PASSIVE DIAGNOSTIC");pros::lcd::set_text(1,"HEALTH: STILL FOR 2s");
+  if (pros::lcd::is_initialized()) pros::lcd::set_text(0,"PASSIVE DIAGNOSTIC");if (pros::lcd::is_initialized()) pros::lcd::set_text(1,"HEALTH: STILL FOR 2s");
   diag_print("[STAGE A] SENSOR HEALTH\nKeep stationary for 2 seconds. IMU P%d installed=%d calibrating=%d status=%d\n",
     chassis.imu.get_port(),chassis.imu.is_installed(),chassis.imu.is_calibrating(),static_cast<int>(chassis.imu.get_status()));
   const auto initial=read_sample();
@@ -195,7 +195,7 @@ void run_full_system_diag(){
     const auto start=read_sample();
     const bool window_valid=capture_window(manual_ms);
     const auto end=read_sample();
-    pros::lcd::set_text(1,"MANUAL WINDOW FINISHED");
+    if (pros::lcd::is_initialized()) pros::lcd::set_text(1,"MANUAL WINDOW FINISHED");
     manual_start=start;manual_end=end;manual_captured=true;
     manual_valid=window_valid && start.valid && end.valid;
     const double angle=end.rotation-start.rotation;

@@ -1,8 +1,10 @@
 
 #include "subsystems.hpp"
 #include "lift_calibration.hpp"
+#include "EZ-Template/navigation_hooks.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace {
@@ -16,7 +18,7 @@ static_assert(THIRD_LIFT_PORT >= 1 && THIRD_LIFT_PORT <= 21 &&
               THIRD_LIFT_PORT != LIFT_ROTATION_PORT && THIRD_LIFT_PORT != ARM_MOTOR_PORT &&
               THIRD_LIFT_PORT != FLEX_LEFT_PORT && THIRD_LIFT_PORT != FLEX_RIGHT_PORT &&
               THIRD_LIFT_PORT != TOGGLE_PORT && THIRD_LIFT_PORT != TOGGLE_OTHER_PORT &&
-              THIRD_LIFT_PORT != 1 && THIRD_LIFT_PORT != 2 && THIRD_LIFT_PORT != 3 &&
+              THIRD_LIFT_PORT != 6 && THIRD_LIFT_PORT != 2 && THIRD_LIFT_PORT != 3 &&
               THIRD_LIFT_PORT != 4 && THIRD_LIFT_PORT != 5 && THIRD_LIFT_PORT != 7 &&
               THIRD_LIFT_PORT != 20,
               "Third lift port conflicts with an existing hardware assignment");
@@ -127,6 +129,7 @@ void update_lift_home_switch() {
 enum class AxisMode { Disabled, Manual, Hold, MoveToTarget, Fault };
 struct AxisState {
   AxisMode mode = AxisMode::Disabled;
+  const char* auton_reason = "NONE";
   bool initialized = false;
   bool homed = false;
   double target = 0.0;
@@ -135,6 +138,8 @@ struct AxisState {
   unsigned manual_refresh = 0;
   unsigned target_started = 0;
   unsigned target_timeout_ms = TARGET_TIMEOUT_MS;
+  bool preload_crossing = false;
+  int crossing_direction = 1;
   unsigned settled_since = 0;
   bool settling = false;
   bool settled = false;
@@ -142,6 +147,7 @@ struct AxisState {
 };
 AxisState lift;
 AxisState arm;
+PreloadLiftResult preload_result = PreloadLiftResult::Idle;
 bool returning_home = false;
 // An explicitly invoked diagnostic owns output only while it is running.
 bool lift_response_running = false;
@@ -322,6 +328,7 @@ if (is_lift) {
   const bool stopped = !axis.initialized || write_voltage(is_lift, 0);
   fault = fault || !stopped;
   axis.mode = fault ? AxisMode::Fault : AxisMode::Disabled;
+  axis.preload_crossing = false;
   axis.manual_mv = 0;
   axis.settling = false;
   axis.settled = false;
@@ -391,6 +398,7 @@ bool zero_axis(AxisState& axis, bool is_lift) {
 void capture_hold(AxisState& axis, bool is_lift) {
   if (is_lift && lift_output_owner != LiftOutputOwner::None) return;
   if (is_lift && returning_home) return;
+  axis.preload_crossing = false;
   axis.manual_mv = 0;
   axis.settling = false;
   axis.settled = false;
@@ -478,6 +486,7 @@ bool set_target(AxisState& axis, bool is_lift, double target,
     disable_axis(axis, is_lift, true);
     return false;
   }
+  axis.preload_crossing = false; // Normal callers always keep normal settling behavior.
   axis.target = target;
   axis.mode = AxisMode::MoveToTarget;
   axis.target_started = pros::millis();
@@ -492,6 +501,12 @@ bool set_target(AxisState& axis, bool is_lift, double target,
 // One control step: read position, check timeouts, then choose a limited motor voltage.
 // The owning task must keep calling this; it is not a background controller.
 
+bool preload_target_reached(double position, double target, int direction) {
+  return std::fabs(position - target) <= LIFT_TARGET_TOLERANCE_DEG ||
+      (direction > 0 && position >= target) ||
+      (direction < 0 && position <= target);
+}
+
 void update_axis(AxisState& axis, bool is_lift) {
   if (!axis.initialized ||
       axis.mode == AxisMode::Disabled ||
@@ -501,6 +516,7 @@ void update_axis(AxisState& axis, bool is_lift) {
   const unsigned elapsed = now - axis.last_update;
 
   if (elapsed > MAX_UPDATE_GAP_MS) {
+    axis.auton_reason="UPDATE_GAP";
     // A delayed automatic lift update is a recoverable abort.
     // Stop motor output without intentionally erasing the home reference.
     if (is_lift &&
@@ -522,6 +538,7 @@ void update_axis(AxisState& axis, bool is_lift) {
   const double position = read_position(is_lift);
 
   if (!std::isfinite(position)) {
+    axis.auton_reason="INVALID_FEEDBACK";
     disable_axis(axis, is_lift, true);
 
     if (is_lift)
@@ -548,6 +565,7 @@ void update_axis(AxisState& axis, bool is_lift) {
 
   if (axis.mode != AxisMode::Manual) {
     if (!feedback_ready(axis, is_lift)) {
+      axis.auton_reason="FEEDBACK_NOT_READY";
       disable_axis(axis, is_lift);
       return;
     }
@@ -557,7 +575,22 @@ void update_axis(AxisState& axis, bool is_lift) {
         ? LIFT_TARGET_TOLERANCE_DEG
         : ARM_TARGET_TOLERANCE_DEG;
 
-    if (std::fabs(error) <= tolerance) {
+    if (is_lift && axis.preload_crossing) {
+      // Preload only: existing tolerance OR directional crossing, with no dwell.
+      // Once reached, Hold has no movement timeout and keeps using this same PID.
+      if (axis.mode == AxisMode::MoveToTarget) {
+        if (now - axis.target_started >= axis.target_timeout_ms) {
+          axis.auton_reason = "TARGET_TIMEOUT";
+          if (!disable_axis(axis, true)) axis.auton_reason = "STOP_WRITE_FAILED";
+          return;
+        }
+        if (preload_target_reached(position, axis.target, axis.crossing_direction)) {
+          axis.settled = true;
+          axis.mode = AxisMode::Hold;
+          axis.auton_reason = "REACHED_HOLD";
+        }
+      }
+    } else if (std::fabs(error) <= tolerance) {
       if (!axis.settling)
         axis.settled_since = now;
 
@@ -574,6 +607,7 @@ void update_axis(AxisState& axis, bool is_lift) {
         axis.mode = AxisMode::Hold;
       } else if (
           now - axis.target_started >= axis.target_timeout_ms) {
+        axis.auton_reason="TARGET_TIMEOUT";
 
         if (is_lift) {
           const double target = axis.target;
@@ -605,6 +639,7 @@ void update_axis(AxisState& axis, bool is_lift) {
 
     if (!std::isfinite(output) ||
         cap < 0 || cap > 12000) {
+      axis.auton_reason="INVALID_CONTROL_OUTPUT";
       disable_axis(axis, is_lift, true);
       return;
     }
@@ -618,6 +653,7 @@ void update_axis(AxisState& axis, bool is_lift) {
   if (!write_voltage(
           is_lift,
           limit_voltage(axis, is_lift, position, mv))) {
+    axis.auton_reason="MOTOR_WRITE_OR_SAFETY_FAILURE";
 
     disable_axis(axis, is_lift, true);
 
@@ -693,7 +729,16 @@ void lift_initialize() {
   home_switch = LiftHomeSwitchState{};
   initialize_axis(lift, true);
 }
-void arm_initialize() { initialize_axis(arm, false); }
+void arm_initialize() {
+    if (!mechanism_config::ARM_CONFIGURED) {
+        arm = AxisState{};
+        return;
+    }
+
+    initialize_axis(arm, false);
+}
+
+
 void mechanisms_initialize() {
   flex_stop();
   toggle_stop();
@@ -886,29 +931,58 @@ bool lift_full_command(
 // STOP is the default; powered hold needs explicit validation and continued updates.
 bool auton_move_axis(AxisState& axis, bool is_lift, double target, unsigned timeout_ms,
                      LiftFinish finish = LiftFinish::STOP) {
-  // Sequential ownership transfer: abandon any previous output before validation.
-  if (!disable_axis(axis, is_lift, axis.mode == AxisMode::Fault)) return false;
-  if (finish != LiftFinish::STOP && (finish != LiftFinish::HOLD_CURRENT_TARGET ||
-      !is_lift || !lift_calibration::hold_validated)) return false;
-  if (pros::competition::is_disabled() || !pros::competition::is_autonomous() ||
-      timeout_ms == 0 || !set_target(axis, is_lift, target, timeout_ms)) return false;
-  const unsigned began = pros::millis();
-  while (!pros::competition::is_disabled() && pros::competition::is_autonomous() &&
-         pros::millis() - began < timeout_ms) {
+  axis.auton_reason="START";
+  if(!disable_axis(axis,is_lift,axis.mode==AxisMode::Fault)) {
+    axis.auton_reason="STOP_WRITE_FAILED"; return false;
+  }
+  if(ez::autonomous_cancelled()) { axis.auton_reason="CANCELLED_OR_MODE"; return false; }
+  if(!axis.initialized) { axis.auton_reason="NOT_INITIALIZED"; return false; }
+  if(axis.mode==AxisMode::Fault) { axis.auton_reason="LATCHED_FAULT"; return false; }
+  if(!axis.homed) { axis.auton_reason="NOT_HOMED"; return false; }
+  if(!feedback_ready(axis,is_lift)) { axis.auton_reason="FEEDBACK_UNVERIFIED"; return false; }
+  if(!limits_ready(is_lift)) { axis.auton_reason="LIMITS_UNCALIBRATED"; return false; }
+  if(!std::isfinite(target) || target<(is_lift?LIFT_MIN_DEG:ARM_MIN_DEG) ||
+      target>(is_lift?LIFT_MAX_DEG:ARM_MAX_DEG)) {
+    axis.auton_reason="INVALID_OR_OUT_OF_LIMIT_TARGET"; return false;
+  }
+  if(finish!=LiftFinish::STOP && (finish!=LiftFinish::HOLD_CURRENT_TARGET ||
+      !is_lift || !lift_calibration::hold_validated)) {
+    axis.auton_reason="HOLD_NOT_VALIDATED"; return false;
+  }
+  if(!timeout_ms) { axis.auton_reason="ZERO_TIMEOUT"; return false; }
+  if(is_lift && ENABLE_LIFT_CALIBRATION_MODE) { axis.auton_reason="CALIBRATION_MODE"; return false; }
+  if(!set_target(axis,is_lift,target,timeout_ms)) {
+    axis.auton_reason=axis.mode==AxisMode::Fault?"SENSOR_OR_OUTPUT_FAULT":"TARGET_OWNERSHIP_REJECTED";
+    return false;
+  }
+  const unsigned began=pros::millis();
+  while(!ez::autonomous_cancelled() && pros::millis()-began<timeout_ms) {
     mechanisms_update();
-    if (axis.mode == AxisMode::Fault || !std::isfinite(read_position(is_lift))) break;
-    if (at_target(axis, is_lift)) {
-      if (finish == LiftFinish::HOLD_CURRENT_TARGET) return true;
-      // No hidden powered hold while a subsequent legacy navigation call blocks.
-      return disable_axis(axis, is_lift);
+    if(axis.mode==AxisMode::Fault) {
+      if(std::strcmp(axis.auton_reason,"START")==0) axis.auton_reason="SENSOR_OR_OUTPUT_FAULT";
+      break;
+    }
+    if(!std::isfinite(read_position(is_lift))) { axis.auton_reason="INVALID_FEEDBACK"; break; }
+    // An update-gap/timeout abort is already stopped; don't wait out the remaining budget.
+    if(axis.mode==AxisMode::Disabled) break;
+    if(at_target(axis,is_lift)) {
+      if(finish==LiftFinish::HOLD_CURRENT_TARGET) { axis.auton_reason="REACHED_HOLD"; return true; }
+      const bool stopped=disable_axis(axis,is_lift);
+      axis.auton_reason=stopped?"REACHED_STOPPED":"STOP_WRITE_FAILED";
+      return stopped;
     }
     pros::delay(mechanism_config::UPDATE_PERIOD_MS);
   }
-  disable_axis(axis, is_lift, axis.mode == AxisMode::Fault);
+  if(ez::autonomous_cancelled()) axis.auton_reason="CANCELLED_OR_MODE";
+  else if(std::strcmp(axis.auton_reason,"START")==0)
+    axis.auton_reason=pros::millis()-began>=timeout_ms?"TARGET_TIMEOUT":"CONTROL_ABORT";
+  if(!disable_axis(axis,is_lift,axis.mode==AxisMode::Fault)) axis.auton_reason="STOP_WRITE_FAILED";
   return false;
 }
+
 } // namespace
 
+const char* lift_auton_last_reason() { return lift.auton_reason; }
 bool lift_auton_up_full() { return lift_full_command(1, LiftOutputOwner::Autonomous); }
 bool lift_auton_down_full() { return lift_full_command(-1, LiftOutputOwner::Autonomous); }
 bool lift_auton_stop() {
@@ -917,7 +991,7 @@ bool lift_auton_stop() {
   return cancelled && stopped;
 }
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms) {
-  return auton_move_axis(lift, true, target_deg, timeout_ms);
+  return lift_auton_move_to_deg(target_deg, timeout_ms, LiftFinish::STOP);
 }
 
 
@@ -1095,7 +1169,12 @@ void lift_update() {
   if (!write_voltage(true, -mechanism_config::LIFT_MANUAL_MV))
     disable_axis(lift, true, true);
 }
-void arm_update() { update_axis(arm, false); }
+void arm_update() {
+    if (mechanism_config::ARM_CONFIGURED) {
+        update_axis(arm, false);
+    }
+}
+
 void mechanisms_update() {
   if (pros::competition::is_disabled()) { stop_all_mechanisms(); return; }
   lift_update();
@@ -1133,10 +1212,21 @@ ArmMode arm_mode() {
 // ----- Pneumatic commands -----
 // Routes request open/closed states here instead of writing raw ADI outputs.
 bool claw_set(bool open) {
+  if (pros::competition::is_autonomous() && ez::autonomous_cancelled()) return false;
   if (!open && returning_home) return false; // R1 cannot close during descent.
-  if (!claw_pneumatic_available() || pros::competition::is_disabled()) return false;
+  if (!claw_pneumatic_available() || pros::competition::is_disabled()) {
+    if (pros::competition::is_autonomous()) {
+      ez::autonomous_emergency_stop();
+      std::printf("CLAW rejected: unavailable or disabled\n");
+    }
+    return false;
+  }
   const bool output = open ? mechanism_config::CLAW_OPEN_OUTPUT : !mechanism_config::CLAW_OPEN_OUTPUT;
   if (claw_piston(output).set_value(output) == PROS_ERR) {
+    if (pros::competition::is_autonomous()) {
+      ez::autonomous_emergency_stop();
+      std::printf("CLAW output write failed\n");
+    }
     claw_state_written = false;
     return false;
   }
@@ -1173,15 +1263,40 @@ bool color_toggle_set(bool held) {
 }
 // Shared motor cleanup for faults and mode changes; leave pneumatic positions alone.
 bool stop_all_mechanisms() {
-  flex_hold_active = false;
-  const bool flex_ok = !flex_available() || flex_stop();
-  const bool toggle_ok = !toggle_available() || toggle_stop();
-  home_switch = LiftHomeSwitchState{};
-  const bool lift_ok = disable_axis(lift, true, lift.mode == AxisMode::Fault);
-  const bool arm_ok = disable_axis(arm, false, arm.mode == AxisMode::Fault);
-  object_detected = false;
-  object_readings = 0;
-  return flex_ok && toggle_ok && lift_ok && arm_ok;
+    flex_hold_active = false;
+
+    const bool flex_ok =
+        !flex_available() || flex_stop();
+
+    const bool toggle_ok =
+        !toggle_available() || toggle_stop();
+
+    home_switch = LiftHomeSwitchState{};
+
+    const bool lift_ok =
+        disable_axis(lift, true, lift.mode == AxisMode::Fault);
+
+    const bool arm_ok =
+        !mechanism_config::ARM_CONFIGURED ||
+        disable_axis(arm, false, arm.mode == AxisMode::Fault);
+
+    std::printf(
+        "STOP CONFIG CHECK V2: flex=%d arm=%d\n",
+        mechanism_config::FLEX_CONFIGURED,
+        mechanism_config::ARM_CONFIGURED
+    );
+
+    std::printf(
+        "MECHANISM STOP: flex=%d toggle=%d lift=%d arm=%d\n",
+        flex_ok, toggle_ok, lift_ok, arm_ok
+    );
+
+    std::fflush(stdout);
+
+    object_detected = false;
+    object_readings = 0;
+
+    return flex_ok && toggle_ok && lift_ok && arm_ok;
 }
 void mechanisms_print_debug() {
   static unsigned last_print = 0;
@@ -1382,7 +1497,7 @@ constexpr bool smart_port_valid(int port) { return port >= 1 && port <= 21; }
 // Reject active assignments and the remaining P13 historical reservation.
 // Legacy P11/P12 distance placeholders are inactive; that module remains excluded.
 constexpr bool new_motor_port_free(int port) {
-  return smart_port_valid(port) && port != 1 && port != 2 && port != 3 &&
+  return smart_port_valid(port) && port != 6 && port != 2 && port != 3 &&
          port != 4 && port != 5 && port != 7 && port != 20 &&
          port != 13 &&
          port != LEFT_LIFT_PORT && port != RIGHT_LIFT_PORT &&
@@ -1451,12 +1566,12 @@ bool flex_available() {
 }
 bool toggle_available() {
   using namespace mechanism_config;
-  return TOGGLE_CONFIGURED && new_motor_port_free(TOGGLE_PORT) &&
-         new_motor_port_free(TOGGLE_OTHER_PORT) && TOGGLE_PORT != TOGGLE_OTHER_PORT &&
-         (!FLEX_CONFIGURED || (TOGGLE_PORT != FLEX_LEFT_PORT && TOGGLE_PORT != FLEX_RIGHT_PORT &&
-                              TOGGLE_OTHER_PORT != FLEX_LEFT_PORT && TOGGLE_OTHER_PORT != FLEX_RIGHT_PORT));
-}
-bool flex_intake(int power) { return flex_command(power, 1); }
+  if (!TOGGLE_CONFIGURED || !new_motor_port_free(TOGGLE_PORT)) return false;
+  if (FLEX_CONFIGURED && (TOGGLE_PORT == FLEX_LEFT_PORT || TOGGLE_PORT == FLEX_RIGHT_PORT)) return false;
+  if (TOGGLE_SINGLE_MOTOR_TEST) return true; // Secondary port is deliberately unassigned.
+  return new_motor_port_free(TOGGLE_OTHER_PORT) && TOGGLE_PORT != TOGGLE_OTHER_PORT &&
+      (!FLEX_CONFIGURED || (TOGGLE_OTHER_PORT != FLEX_LEFT_PORT && TOGGLE_OTHER_PORT != FLEX_RIGHT_PORT));
+}bool flex_intake(int power) { return flex_command(power, 1); }
 bool flex_outtake(int power) { return flex_command(power, -1); }
 bool flex_stop() {
   if (!flex_available()) return false;
@@ -1466,7 +1581,7 @@ bool flex_stop() {
 }
 namespace {
 // ----- Toggle pair -----
-// Single-motor test commands only P19; otherwise the mirrored P6/P19 pair shares a command.
+// Single-motor mode commands only P19; dual mode requires validated assigned ports.
 bool toggle_command(bool reverse) {
   if (!toggle_available()) return false;
   if (pros::competition::is_disabled() || TOGGLE_POWER < 1 || TOGGLE_POWER > 127 ||
@@ -1484,6 +1599,22 @@ bool toggle_command(bool reverse) {
   return false;
 }
 } // namespace
+bool pulse_toggle() {
+  const unsigned began = pros::millis();
+  bool ok = !ez::autonomous_cancelled() && toggle_connected() && toggle_run();
+  while (ok && pros::millis() - began < 395) {
+    ok = !ez::autonomous_cancelled() && toggle_connected();
+    if (ok) {
+      const unsigned elapsed = pros::millis() - began;
+      if (elapsed < 395) pros::delay(395 - elapsed < 5 ? 395 - elapsed : 5);
+    }
+  }
+  const bool stopped = toggle_stop();
+  ok = ok && stopped && !ez::autonomous_cancelled();
+  if (!ok) ez::autonomous_emergency_stop();
+  std::printf("TOGGLE start_t=%u finish_t=%u pulse_ms=%u success=%d stopped=%d\n",began,pros::millis(),pros::millis()-began,ok,stopped);
+  return ok;
+}
 bool toggle_run() { return toggle_command(false); }
 bool toggle_run_reverse() { return toggle_command(true); }
 bool toggle_stop() {
@@ -1549,22 +1680,128 @@ bool pickup_prepare(int power) { return claw_and_flex(true, true, power); }
 bool pickup_capture(int power) { return claw_grab(power); }
 bool pickup_finish() { return flex_stop(); }
 
+namespace {
+PreloadLiftResult preload_stop_result(PreloadLiftResult result, const char* reason) {
+  const bool stopped = lift_auton_stop();
+  lift.auton_reason = stopped ? reason : "STOP_WRITE_FAILED";
+  preload_result = stopped ? result : PreloadLiftResult::Fault;
+  return preload_result;
+}
+}
+bool lift_preload_start(double target_deg, unsigned timeout_ms) {
+  preload_result = PreloadLiftResult::Idle;
+  if (ez::autonomous_cancelled()) {
+    preload_stop_result(PreloadLiftResult::Cancelled,"CANCELLED_OR_MODE"); return false;
+  }
+  if (!lift_target_ready()) {
+    preload_stop_result(PreloadLiftResult::Fault,"FEEDBACK_HOME_LIMITS_OR_OUTPUT_FAULT"); return false;
+  }
+  const double position = lift_position_deg();
+  if (position < LIFT_MIN_DEG || position > LIFT_MAX_DEG ||
+      !std::isfinite(target_deg) || target_deg < LIFT_MIN_DEG || target_deg > LIFT_MAX_DEG) {
+    preload_stop_result(PreloadLiftResult::LimitViolation,"PHYSICAL_LIMIT_OR_INVALID_TARGET"); return false;
+  }
+  if (!lift_auton_stop()) {
+    preload_stop_result(PreloadLiftResult::Fault,"STOP_WRITE_FAILED"); return false;
+  }
+  if (!set_target(lift,true,target_deg,timeout_ms)) {
+    preload_stop_result(PreloadLiftResult::Rejected,"TARGET_COMMAND_REJECTED"); return false;
+  }
+  lift.preload_crossing = true;
+  lift.crossing_direction = target_deg >= lift.previous_position ? 1 : -1;
+  preload_result = PreloadLiftResult::Moving;
+  lift.auton_reason = "MOVING_TO_CROSSING";
+  if (preload_target_reached(lift.previous_position, target_deg, lift.crossing_direction)) {
+    lift.mode = AxisMode::Hold;
+    lift.settled = true;
+    lift.auton_reason = "REACHED_HOLD";
+    preload_result = PreloadLiftResult::Reached;
+  }
+  return true;
+}
+PreloadLiftResult lift_preload_update() {
+  if (ez::autonomous_cancelled())
+    return preload_stop_result(PreloadLiftResult::Cancelled,"CANCELLED_OR_MODE");
+  if (preload_result == PreloadLiftResult::Idle || preload_result == PreloadLiftResult::Rejected ||
+      preload_result == PreloadLiftResult::Cancelled || preload_result == PreloadLiftResult::Fault ||
+      preload_result == PreloadLiftResult::LimitViolation) return preload_result;
+  if (!lift_target_ready())
+    return preload_stop_result(PreloadLiftResult::Fault,"FEEDBACK_HOME_LIMITS_OR_OUTPUT_FAULT");
+  const double position = lift_position_deg();
+  if (!std::isfinite(position))
+    return preload_stop_result(PreloadLiftResult::Fault,"INVALID_FEEDBACK");
+  if (position < LIFT_MIN_DEG || position > LIFT_MAX_DEG)
+    return preload_stop_result(PreloadLiftResult::LimitViolation,"PHYSICAL_LIMIT_VIOLATION");
+  if (preload_result == PreloadLiftResult::Timeout) return preload_result; // Stopped; navigation may continue.
+  if (position > lift.target) {
+    const auto bottom = lift_bottom_limit_read();
+    if (bottom == LiftBottomLimit::Fault)
+      return preload_stop_result(PreloadLiftResult::Fault,"BOTTOM_LIMIT_SENSOR_FAULT");
+    if (bottom == LiftBottomLimit::Pressed || position <= LIFT_LOWER_STOP_MARGIN_DEG)
+      return preload_stop_result(PreloadLiftResult::LimitViolation,"LOWER_TRAVEL_LIMIT");
+  }
+  mechanisms_update();
+  if (lift.mode == AxisMode::Fault || lift_output_fault)
+    return preload_stop_result(PreloadLiftResult::Fault,lift.auton_reason);
+  if (lift.mode == AxisMode::Disabled) {
+    const auto result = std::strcmp(lift.auton_reason,"TARGET_TIMEOUT") == 0
+        ? PreloadLiftResult::Timeout : PreloadLiftResult::Fault;
+    return preload_stop_result(result,lift.auton_reason);
+  }
+  if (!lift.preload_crossing || (lift.mode != AxisMode::MoveToTarget && lift.mode != AxisMode::Hold))
+    return preload_stop_result(PreloadLiftResult::Fault,"LIFT_OWNERSHIP_CHANGED");
+  if (lift.mode == AxisMode::Hold) preload_result = PreloadLiftResult::Reached;
+  return preload_result;
+}
 bool lift_target_ready() {
   return feedback_ready(lift,true) && limits_ready(true) &&
       std::isfinite(read_position(true)) && !lift_output_fault;
 }
 bool lift_auton_move_to_deg(double target,unsigned timeout,LiftFinish finish) {
-  return auton_move_axis(lift,true,target,timeout,finish);
+  const bool reached = auton_move_axis(lift,true,target,timeout,finish);
+  const char* reason = lift_auton_last_reason();
+  const double actual = lift_position_deg();
+  const bool recoverable = !reached &&
+      (std::strcmp(reason,"TARGET_TIMEOUT")==0 || std::strcmp(reason,"UPDATE_GAP")==0) &&
+      lift_target_ready() && std::isfinite(actual) &&
+      actual >= mechanism_config::LIFT_MIN_DEG && actual <= mechanism_config::LIFT_MAX_DEG;
+  if (!reached && !recoverable) ez::autonomous_emergency_stop();
+  std::printf("LIFT target=%.3f actual=%.3f reached=%d reason=%s recoverable=%d\n",
+              target,actual,reached,reason,recoverable);
+  return reached;
 }
 bool lift_move_calibrated_position(unsigned preset,unsigned timeout,LiftFinish finish) {
   if (preset >= lift_calibration::positions.size()) return false;
   const auto& p=lift_calibration::positions[preset];
   return p.configured && std::isfinite(p.degrees) && lift_auton_move_to_deg(p.degrees,timeout,finish);
 }
+
 bool toggle_connected() {
-  return toggle_available() && toggle_motor().is_installed() &&
-         (TOGGLE_SINGLE_MOTOR_TEST || toggle_other_motor().is_installed());
+    if (!toggle_available()) {
+        return false;
+    }
+
+    // Check physical ports using positive port numbers.
+    // Avoid the reversed-motor is_installed() issue.
+    static pros::Motor p19_check(
+        mechanism_config::TOGGLE_PORT,
+        pros::v5::MotorGears::green
+    );
+
+    const bool p19_connected = p19_check.is_installed();
+
+    if (mechanism_config::TOGGLE_SINGLE_MOTOR_TEST) {
+        return p19_connected;
+    }
+
+    static pros::Motor secondary_check(
+        mechanism_config::TOGGLE_OTHER_PORT,
+        pros::v5::MotorGears::green
+    );
+
+    return p19_connected && secondary_check.is_installed();
 }
+
 // ----- Route hardware snapshot -----
 // Report every mechanism, but only required devices can fail this route's preflight.
 bool mechanisms_preflight(bool require_lift,bool require_toggle,bool require_flex) {

@@ -9,6 +9,9 @@ struct PathControlFrame {
   double xy_scaled, angular_scaled, left, right;
   int direction_sign, flipped;
   bool output_enabled;
+  double angular_target = 0; // Exact native computed heading target, degrees.
+  double target_x = 0, target_y = 0, target_heading = 0;
+  bool bias_enabled = false;
 };
 using PathTraceHook = void (*)(Drive*, const PathControlFrame&);
 void path_trace_hook_set(PathTraceHook hook);

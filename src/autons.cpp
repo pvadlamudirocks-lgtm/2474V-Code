@@ -65,16 +65,34 @@ void default_constants() {
   chassis.pid_odom_angular_constants_set(6.5, 0.0, 52.5);
   chassis.pid_odom_boomerang_constants_set(5.8, 0.0, 32.5);
 
-  chassis.pid_turn_exit_condition_set(150_ms, 1_deg, 250_ms, 7_deg,
-                                      500_ms, 500_ms);
+  // Steady rotation can have near-zero IMU acceleration. Use heading-change
+  // stall detection and motor overcurrent protection, not secondary acceleration.
+  
   chassis.pid_swing_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg,
                                        500_ms, 500_ms);
-  chassis.pid_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in,
-                                       500_ms, 500_ms);
-  chassis.pid_odom_turn_exit_condition_set(90_ms, 3_deg, 250_ms, 7_deg,
-                                           500_ms, 750_ms);
-  chassis.pid_odom_drive_exit_condition_set(90_ms, 1_in, 250_ms, 3_in,
-                                            500_ms, 750_ms);
+
+chassis.pid_odom_drive_exit_condition_set(
+    90_ms, 1_in, 250_ms, 3_in,
+    1000_ms, 750_ms, false);
+
+    
+chassis.pid_odom_turn_exit_condition_set(
+    90_ms, 3_deg, 250_ms, 7_deg,
+    1000_ms, 750_ms, false);
+
+  
+  
+std::printf(
+    "ODOM EXIT LIVE: XY=%d ms, IMU=%d | ANG=%d ms, IMU=%d\n",
+    chassis.xyPID.exit.velocity_exit_time,
+    static_cast<int>(
+        chassis.xyPID.velocity_sensor_secondary_toggle_get()),
+    chassis.current_a_odomPID.exit.velocity_exit_time,
+    static_cast<int>(
+        chassis.current_a_odomPID.velocity_sensor_secondary_toggle_get())
+);
+std::fflush(stdout);
+
   chassis.pid_turn_chain_constant_set(3_deg);
   chassis.pid_swing_chain_constant_set(5_deg);
   chassis.pid_drive_chain_constant_set(3_in);
@@ -812,7 +830,7 @@ bool toggle_test(bool run) {
     return false;
   }
   const bool ok = run ? toggle_run() : toggle_stop();
-  std::printf("[TOGGLE TEST] %s accepted=%d\n", run ? "RUN (P6 + P19)" : "STOP", ok);
+  std::printf("[TOGGLE TEST] %s accepted=%d\n", run ? (mechanism_config::TOGGLE_SINGLE_MOTOR_TEST ? "RUN (P19 only)" : "RUN (configured Toggle pair)") : "STOP", ok);
   return ok;
 }
 bool pickup_sequence_test(PickupTestStep step) {

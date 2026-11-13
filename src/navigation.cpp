@@ -8,6 +8,7 @@
 #include <cstdio>
 
 namespace {
+bool start_reference_valid = true; // Existing initialized odometry until an explicit reset fails.
 double wrap_heading(double degrees) {
   const double wrapped = std::fmod(degrees, 360.0);
   return wrapped < 0.0 ? wrapped + 360.0 : wrapped;
@@ -56,6 +57,7 @@ double nav_theta_get() {
 }
 
 void nav_set_start(double x_in, double y_in, double theta_deg) {
+  start_reference_valid = false;
   nav_print_snapshot("BEFORE nav_set_start");
   if (!std::isfinite(x_in) || !std::isfinite(y_in) ||
       !std::isfinite(theta_deg)) {
@@ -80,6 +82,8 @@ void nav_set_start(double x_in, double y_in, double theta_deg) {
         std::fabs(angle_error(pose.theta, actual.theta)) <= 0.5 &&
         std::fabs(angle_error(pose.theta, imu_heading)) <= 0.5;
   } while (!heading_ready && pros::millis() - start_ms < 250);
+  start_reference_valid = heading_ready && std::isfinite(actual.x) && std::isfinite(actual.y) &&
+      std::hypot(actual.x - pose.x, actual.y - pose.y) <= 0.5;
   nav_print_snapshot("AFTER nav_set_start");
   if (!heading_ready) std::printf("START RESET FAILED: heading readback timeout\n");
 }
@@ -87,14 +91,67 @@ void nav_set_start(double x_in, double y_in, double theta_deg) {
 // ----- Blocking navigation wrappers -----
 // Send the requested movement to EZ and wait for its exit conditions.
 // Returning from a wait alone does not prove that the physical target was reached.
+
+namespace {
+bool point_sensors_ready() { return chassis.odom_enabled() && nav_sensors_ready(); }
+bool point_rest() {
+  const unsigned began = pros::millis();
+  unsigned stable = began;
+  while (pros::millis() - began < 2000) {
+    if (ez::autonomous_cancelled()) return false;
+    bool still = true;
+    for (const auto* motors : {&chassis.left_motors, &chassis.right_motors}) {
+      if (motors->empty()) still = false;
+      for (const auto& motor : *motors) {
+        const double rpm = motor.get_actual_velocity();
+        if (!std::isfinite(rpm) || std::fabs(rpm) >= 3) still = false;
+      }
+    }
+    if (!still) stable = pros::millis();
+    else if (pros::millis() - stable >= 100) return true;
+    pros::delay(10);
+  }
+  return false;
+}
+}
 void nav_go_to(double x_in, double y_in, int speed) {
-  const ez::odom movement{nav_game_to_internal_pose({x_in, y_in}), ez::fwd, speed};
+  if (ez::autonomous_cancelled() || !start_reference_valid || !point_sensors_ready() ||
+      !std::isfinite(x_in) || !std::isfinite(y_in) || speed <= 0 || speed > 127 ||
+      !chassis.pid_drive_toggle_get()) {
+    ez::drive_stop(&chassis);
+    if (!point_rest()) ez::autonomous_emergency_stop();
+    std::printf("NAV rejected: cancellation, start reference, sensors, arguments, or motor-output enable\n");
+    return;
+  }
+  // Reuse an already armed diagnostic deadline without extending it.
+  if (!ez::geometry_turn_deadline_active(&chassis)) {
+    ez::drive_stop(&chassis);
+    if (!ez::geometry_turn_deadline_arm(&chassis, point_sensors_ready)) {
+      std::printf("NAV rejected: motor-owner deadline unavailable\n");
+      return;
+    }
+  }
+  const double original_lookahead =
+      chassis.odom_look_ahead_get();
+
+  chassis.odom_look_ahead_set(3_in);
+
+  const ez::odom movement{
+      nav_game_to_internal_pose({x_in, y_in}), ez::fwd, speed};
+
   motion_exit_trace_begin(movement);
   chassis.pid_odom_set(movement);
   chassis.pid_wait();
-  motion_exit_trace_finish();  // No-op unless separately armed.
+  ez::drive_stop(&chassis); // Stop PID before reporting or waiting for rest.
+  motion_exit_trace_finish();
+  chassis.odom_look_ahead_set(original_lookahead);
+  const bool rested = point_rest();
+  if (!rested) ez::autonomous_emergency_stop();
+  const auto final = nav_pose_get();
+  std::printf("NAV final=(%.3f,%.3f,%.3f) deadline=%d interference=%d stopped=1 rest=%d\n",
+              final.x,final.y,final.theta,static_cast<int>(ez::geometry_turn_deadline_result()),
+              chassis.interfered,rested);
 }
-
 void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int speed) {
   const auto target = nav_game_to_internal_pose({x_in, y_in, public_heading_deg});
   const ez::odom movement{target, ez::fwd, speed};  // FRONT-first, as in nav_go_to.
@@ -107,6 +164,7 @@ void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int spe
   // Explicit single-pose API; uses the existing global slew/Boomerang settings.
   chassis.pid_odom_boomerang_set(movement);
   chassis.pid_wait();
+  ez::drive_stop(&chassis);
   const auto final_pose = nav_pose_get();
   const auto exits = pose_exit_trace_finish();
   std::printf("POSE final PUBLIC = (%.3f, %.3f, %.3f deg) [at pid_wait return]\n"

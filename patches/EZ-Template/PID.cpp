@@ -6,6 +6,7 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #include "EZ-Template/api.hpp"
 #include "api.h"
+#include "EZ-Template/navigation_hooks.hpp"
 
 using namespace ez;
 
@@ -144,6 +145,7 @@ exit_output PID::exit_condition(bool print) {
       j += util::DELAY_TIME;
       i = 0;  // While this is running, don't run big thresh
       if (j > exit.small_exit_time) {
+        ez::turn_output_trace_exit(this, "SMALL_ERROR", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(SMALL_EXIT);
         return SMALL_EXIT;
@@ -159,6 +161,7 @@ exit_output PID::exit_condition(bool print) {
     if (abs(error) < exit.big_error) {
       i += util::DELAY_TIME;
       if (i > exit.big_exit_time) {
+        ez::turn_output_trace_exit(this, "BIG_ERROR", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(BIG_EXIT);
         return BIG_EXIT;
@@ -173,6 +176,7 @@ exit_output PID::exit_condition(bool print) {
     if (abs(derivative) <= velocity_zero_main) {
       k += util::DELAY_TIME;
       if (k > exit.velocity_exit_time) {
+        ez::turn_output_trace_exit(this, "VELOCITY_PRIMARY_HEADING_CHANGE", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(VELOCITY_EXIT);
         return VELOCITY_EXIT;
@@ -190,6 +194,7 @@ exit_output PID::exit_condition(bool print) {
     if (abs(second_sensor) <= velocity_zero_secondary) {
       m += util::DELAY_TIME;
       if (m > exit.velocity_exit_time) {
+        ez::turn_output_trace_exit(this, "VELOCITY_SECONDARY_IMU_ACCEL", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(VELOCITY_EXIT);
         return VELOCITY_EXIT;
@@ -210,6 +215,7 @@ exit_output PID::exit_condition(pros::Motor sensor, bool print) {
     if (sensor.is_over_current()) {
       l += util::DELAY_TIME;
       if (l > exit.mA_timeout) {
+        ez::turn_output_trace_exit(this, "MOTOR_OVER_CURRENT", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(mA_EXIT);
         return mA_EXIT;
@@ -239,6 +245,7 @@ exit_output PID::exit_condition(std::vector<pros::Motor> sensor, bool print) {
     if (is_mA) {
       l += util::DELAY_TIME;
       if (l > exit.mA_timeout) {
+        ez::turn_output_trace_exit(this, "MOTOR_OVER_CURRENT", second_sensor, k, m, l);
         timers_reset();
         if (print) exit_condition_print(mA_EXIT);
         return mA_EXIT;

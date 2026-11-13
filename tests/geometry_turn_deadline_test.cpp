@@ -41,3 +41,18 @@ static_assert(wraparound());
 static_assert(finish_at_deadline());
 static_assert(explicit_rearm());
 static_assert(!Deadline{}.must_stop());
+
+constexpr bool sensor_failure_latches() {
+  Deadline d; d.arm(0,5000); d.update(10,false,false);
+  if (d.result != Result::SensorFault || !d.must_stop()) return false;
+  d.update(20,false,true); d.finish(30,false);
+  return d.result == Result::SensorFault && d.must_stop();
+}
+constexpr bool deadline_and_cancel_precedence() {
+  Deadline d; d.arm(0,5000); d.update(5000,false,false);
+  if (d.result != Result::Timeout) return false;
+  d.arm(0,5000); d.update(5000,true,false);
+  return d.result == Result::Interrupted;
+}
+static_assert(sensor_failure_latches());
+static_assert(deadline_and_cancel_precedence());

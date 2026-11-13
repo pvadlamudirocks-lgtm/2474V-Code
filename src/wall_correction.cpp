@@ -8,7 +8,7 @@ bool available(const auton_math::Sensor& s) {
   if(!auton_math::sensor_valid(s)) return false;
   using namespace mechanism_config;
   // Current navigation ports plus hardware declarations, and P18/P19 reserved.
-  for(int used : {1,2,3,4,5,7,20,18,19,LEFT_LIFT_PORT,RIGHT_LIFT_PORT,LIFT_ROTATION_PORT,
+  for(int used : {6,2,3,4,5,7,20,18,19,LEFT_LIFT_PORT,RIGHT_LIFT_PORT,LIFT_ROTATION_PORT,
       ARM_MOTOR_PORT,ARM_ROTATION_PORT,CLAW_DISTANCE_PORT,FLEX_LEFT_PORT,FLEX_RIGHT_PORT,
       TOGGLE_PORT,TOGGLE_OTHER_PORT,LIFT_HEIGHT_DISTANCE_PORT}) if(s.port==used) return false;
   unsigned matches=0;

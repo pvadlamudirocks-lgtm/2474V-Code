@@ -19,6 +19,7 @@ constexpr double LIFT_MOTOR_RPM = 200.0;
 constexpr double LIFT_SPEED_UP_RATIO = 1.0; // Output speed / motor speed; no scaling.
 constexpr double LIFT_OUTPUT_RPM = LIFT_MOTOR_RPM; // 200 RPM nominal at 1:1, not measured.
 // Keep both PROS lift motors configured as MotorGears::green (18:1, 200 RPM).
+constexpr bool ARM_CONFIGURED = false;
 constexpr int ARM_MOTOR_PORT = 17;
 constexpr int ARM_ROTATION_PORT = 0; // Retired P18 sensor remains unbound.
 constexpr int CLAW_DISTANCE_PORT = 0; // Retired P19 sensor remains unbound.
@@ -39,7 +40,7 @@ constexpr double LIFT_HEIGHT_DISTANCE_MAX_MM = __builtin_nan("");
 // New claw-area hardware: 0 is UNBOUND, never passed to a device constructor.
 constexpr bool CLAW_PNEUMATIC_CONFIGURED = true;
 constexpr int CLAW_PNEUMATIC_PORT = 'H'; // Verified claw solenoid; polarity not yet verified.
-constexpr bool FLEX_CONFIGURED = true;
+constexpr bool FLEX_CONFIGURED = false;
 constexpr int FLEX_LEFT_PORT = 11;  // Claw flex motor moved from port 8.
 constexpr int FLEX_RIGHT_PORT = 12; // Claw flex motor moved from port 10.
 // Mirrored shafts: same semantic command, opposite physical shaft directions.
@@ -48,15 +49,36 @@ constexpr bool FLEX_RIGHT_REVERSED = true; // Preserve the direction used on por
 constexpr int FLEX_INTAKE_SIGN = 1; // UNVERIFIED: flip after physical intake test.
 constexpr int FLEX_INTAKE_POWER = 0; // Uncommissioned; choose power during testing.
 constexpr int FLEX_OUTTAKE_POWER = 0; // Uncommissioned; no tuned speed assumed.
-// Current toggle pair is P6/P19; direction settings apply to every toggle command.
+// P19-only Toggle. The second motor is unassigned until wiring is confirmed.
 constexpr bool TOGGLE_CONFIGURED = true;
-constexpr bool TOGGLE_SINGLE_MOTOR_TEST = true; // Temporary: only P19; false restores the pair.
+constexpr bool TOGGLE_SINGLE_MOTOR_TEST = true; // Only P19; dual mode requires a valid, unused second port.
 constexpr int TOGGLE_PORT = 19;
-constexpr int TOGGLE_OTHER_PORT = 6;
+constexpr int TOGGLE_OTHER_PORT = 0; // Unassigned; never construct or command this port.
 constexpr bool TOGGLE_OTHER_REVERSED = false; // Opposite shaft direction to P19.
 constexpr bool TOGGLE_REVERSED = true; // Preserve P19's existing direction.
 constexpr int TOGGLE_DIRECTION = -1; // Reverse overall direction: requested counterclockwise.
 constexpr int TOGGLE_POWER = 127; // Full command; cartridge remains existing green configuration.
+// Physical Smart Ports only (motor reversal signs do not change ownership).
+// Keep this reservation aligned with chassis {-6,4}/{-3,2}; P5/P7 trackers, P20 IMU.
+constexpr bool active_smart_ports_unique() {
+  const int ports[] = {6,4,3,2,5,7,20,
+      LEFT_LIFT_PORT,RIGHT_LIFT_PORT,THIRD_LIFT_PORT,LIFT_ROTATION_PORT,
+      ARM_CONFIGURED ? ARM_MOTOR_PORT : 0, ARM_CONFIGURED ? ARM_ROTATION_PORT : 0,
+      CLAW_DISTANCE_PORT,LIFT_HEIGHT_DISTANCE_PORT,
+      FLEX_CONFIGURED ? FLEX_LEFT_PORT : 0, FLEX_CONFIGURED ? FLEX_RIGHT_PORT : 0,
+      TOGGLE_CONFIGURED ? TOGGLE_PORT : 0,
+      TOGGLE_CONFIGURED && !TOGGLE_SINGLE_MOTOR_TEST ? TOGGLE_OTHER_PORT : 0};
+  for (unsigned i=0;i<sizeof(ports)/sizeof(ports[0]);++i) {
+    if (ports[i] == 0) continue; // Explicitly unassigned/inactive.
+    if (ports[i] < 1 || ports[i] > 21) return false;
+    for (unsigned j=0;j<i;++j) if (ports[j] == ports[i]) return false;
+  }
+  return true;
+}
+static_assert(active_smart_ports_unique(), "Duplicate or invalid active Smart Port assignment");
+static_assert(!TOGGLE_CONFIGURED || TOGGLE_SINGLE_MOTOR_TEST ||
+              (TOGGLE_OTHER_PORT >= 1 && TOGGLE_OTHER_PORT <= 21),
+              "Dual Toggle requires an assigned second Smart Port");
 constexpr char CLAW_FLIP_ADI_PORT = 'B';  // TODO CONFIRM wiring.
 constexpr char LIFT_HOME_SWITCH_ADI_PORT = 'C'; // Teammate-operated command switch.
 // TODO assign the REAL bottom switch port ('A'-'H'). 0 means unbound;
@@ -66,7 +88,7 @@ constexpr bool LIFT_BOTTOM_LIMIT_PRESSED_VALUE = true; // Verify actual wiring.
 // TODO measure worst-case full descent at the existing 1500 mV, then choose
 // a finite timeout with margin. Zero disables return; no guessed travel time.
 constexpr unsigned LIFT_RETURN_TIMEOUT_MS = 0;
-// TODO bind the Override color mechanism; unrelated to the existing claw flip.
+// TODO bind the Over ride color mechanism; unrelated to the existing claw flip.
 // No device type/port is assumed. Implement color_toggle_set() when selected.
 constexpr bool CLAW_OPEN_OUTPUT = false; // User-tested mapping: OFF opens, ON closes; retest after change.
 constexpr bool FLIP_REVERSE_OUTPUT = true; // false output should be normal.
@@ -157,7 +179,7 @@ constexpr unsigned UPDATE_PERIOD_MS = 10;
 constexpr unsigned MANUAL_COMMAND_TIMEOUT_MS = 100;
 constexpr unsigned MAX_UPDATE_GAP_MS = 100;
 constexpr unsigned TARGET_SETTLE_MS = 200;
-constexpr unsigned TARGET_TIMEOUT_MS = 10000; // TODO VERIFY real travel time.
+constexpr unsigned TARGET_TIMEOUT_MS = 2000; // TODO VERIFY real travel time.
 constexpr unsigned DEBUG_PERIOD_MS = 500;
 
 constexpr bool ENABLE_CLAW_DISTANCE_AUTO_ARM = false;
@@ -172,6 +194,11 @@ constexpr int DISTANCE_CONFIDENCE_AVAILABLE_ABOVE_MM = 200; // Installed PROS AP
 
 
 enum class LiftFinish { STOP, HOLD_CURRENT_TARGET };
+// Opt-in preload completion only; all other target APIs retain their settling rules.
+enum class PreloadLiftResult { Idle, Moving, Reached, Timeout, Cancelled, Fault, LimitViolation, Rejected };
+// Same autonomous task must start and update. Reached retains active position hold.
+bool lift_preload_start(double target_deg, unsigned timeout_ms);
+PreloadLiftResult lift_preload_update();
 enum class LiftMode { Disabled, Manual, Hold, MoveToTarget, Fault, ReturningHome,
                       DriverFull, AutonFull };
 enum class ArmMode { Disabled, Manual, Hold, MoveToTarget, Fault };
@@ -232,6 +259,7 @@ bool lift_auton_stop(); // Always attempts zero on BOTH motors, even while disab
 // Sequential, autonomous-only. Caller supplies a MEASURED timeout (no default).
 // Uses the existing controller/gates; stops output on success AND failure.
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms);
+const char* lift_auton_last_reason(); // Last blocking move; static reason, no sensor reset.
 // STOP removes motor output on success; HOLD keeps the same target under sensor control.
 // HOLD requires validation and continued mechanism updates after this blocking call.
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms, LiftFinish finish);
@@ -295,6 +323,7 @@ bool toggle_available();
 bool flex_intake(int power = mechanism_config::FLEX_INTAKE_POWER);
 bool flex_outtake(int power = mechanism_config::FLEX_OUTTAKE_POWER);
 bool flex_stop();
+bool pulse_toggle();  // Cancellable 395 ms pulse, followed by stop.
 bool toggle_run();
 bool toggle_run_reverse();
 bool toggle_stop();
