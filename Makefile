@@ -62,7 +62,7 @@ $(HOT_ELF): $(BINDIR)/exit_conditions.cpp.o
 # EZ v3.2.2 PID.cpp, with only the integral sign-reset comparison corrected.
 # Replace the archive member so cold-image controllers also use the correction.
 # Source: https://github.com/EZ-Robotics/EZ-Template/blob/v3.2.2/src/EZ-Template/PID.cpp
-$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp $(INCDIR)/geometry_turn_deadline.hpp Makefile
+$(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hpp patches/EZ-Template/pid_tasks.cpp $(INCDIR)/EZ-Template/path_trace_hook.hpp patches/EZ-Template/exit_conditions.cpp $(INCDIR)/EZ-Template/navigation_hooks.hpp $(INCDIR)/geometry_turn_deadline.hpp Makefile patches/EZ-Template/drive.cpp patches/EZ-Template/set_odom_pid.cpp patches/EZ-Template/slew.cpp $(INCDIR)/EZ-Template/motion_output_safety.hpp
 	mkdir -p $(BINDIR)/ez_pid_patch
 	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/PID.cpp.o $<
 	$(AR) r $@ $(BINDIR)/ez_pid_patch/PID.cpp.o
@@ -71,3 +71,17 @@ $(FWDIR)/EZ-Template.a: patches/EZ-Template/PID.cpp $(INCDIR)/EZ-Template/PID.hp
 
 	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/exit_conditions.cpp.o patches/EZ-Template/exit_conditions.cpp
 	$(AR) r $@ $(BINDIR)/ez_pid_patch/exit_conditions.cpp.o
+
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/drive.cpp.o patches/EZ-Template/drive.cpp
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/drive.cpp.o
+
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/set_odom_pid.cpp.o patches/EZ-Template/set_odom_pid.cpp
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/set_odom_pid.cpp.o
+
+	$(CXX) -c $(INCLUDE) $(CXXFLAGS) $(EXTRA_CXXFLAGS) -o $(BINDIR)/ez_pid_patch/slew.cpp.o patches/EZ-Template/slew.cpp
+	$(AR) r $@ $(BINDIR)/ez_pid_patch/slew.cpp.o
+
+	$(AR) s $@
+
+# Phase 1 proof of native archive-member selection in the active monolithic link.
+$(MONOLITH_ELF): private LDFLAGS += -Wl,-Map=$(BINDIR)/phase1-link.map,--cref

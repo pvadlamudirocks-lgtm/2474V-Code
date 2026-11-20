@@ -254,7 +254,12 @@ void pose_exit_trace_begin() {
 
 std::pair<ez::exit_output, ez::exit_output> pose_exit_trace_finish() {
   pose_recording = false;
-  return {pose_xy_exit, pose_angle_exit};
+  // Same-object native calls can bypass --wrap in the monolithic build.
+  // Read the published result; never reevaluate exit conditions.
+  const auto native=ez::native_odom_wait_result(&chassis);
+  if(native.completed)
+    return {static_cast<ez::exit_output>(native.xy),static_cast<ez::exit_output>(native.angular)};
+  return {pose_xy_exit, pose_angle_exit}; // RUNNING means no completed result on cancellation.
 }
 
 // GNU ld --wrap observes the exact overload used by native Drive::pid_wait().

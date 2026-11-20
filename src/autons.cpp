@@ -104,7 +104,7 @@ std::fflush(stdout);
   chassis.odom_turn_bias_set(0.9);
   chassis.odom_look_ahead_set(7_in);
   chassis.odom_boomerang_distance_set(16_in);
-  chassis.odom_boomerang_dlead_set(0.625);
+  chassis.odom_boomerang_dlead_set(0.50);
   chassis.pid_angle_behavior_set(ez::shortest);
 }
 
@@ -302,7 +302,7 @@ void odom_geometry_turn_90_test() {
     return;
   }
   chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
-  chassis.pid_targets_reset();
+  chassis.pid_targets_reset();  
   chassis.drive_sensor_reset();
   chassis.odom_xyt_set(0_in, 0_in, 0_deg);
   pros::delay(50);
@@ -830,7 +830,7 @@ bool toggle_test(bool run) {
     return false;
   }
   const bool ok = run ? toggle_run() : toggle_stop();
-  std::printf("[TOGGLE TEST] %s accepted=%d\n", run ? (mechanism_config::TOGGLE_SINGLE_MOTOR_TEST ? "RUN (P19 only)" : "RUN (configured Toggle pair)") : "STOP", ok);
+  std::printf("[TOGGLE TEST] %s accepted=%d\n", run ? "RUN (P6 + P19)" : "STOP", ok);
   return ok;
 }
 bool pickup_sequence_test(PickupTestStep step) {

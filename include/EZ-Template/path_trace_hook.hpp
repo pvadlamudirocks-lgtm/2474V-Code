@@ -12,7 +12,11 @@ struct PathControlFrame {
   double angular_target = 0; // Exact native computed heading target, degrees.
   double target_x = 0, target_y = 0, target_heading = 0;
   bool bias_enabled = false;
+  bool slew_left_enabled = false, slew_right_enabled = false;
 };
 using PathTraceHook = void (*)(Drive*, const PathControlFrame&);
 void path_trace_hook_set(PathTraceHook hook);
 }  // namespace ez
+
+// Claim/release only an unused observer slot; never replace another diagnostic.
+namespace ez { bool path_trace_hook_claim(PathTraceHook hook); void path_trace_hook_release(PathTraceHook hook); }

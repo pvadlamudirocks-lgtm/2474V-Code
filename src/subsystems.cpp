@@ -18,7 +18,7 @@ static_assert(THIRD_LIFT_PORT >= 1 && THIRD_LIFT_PORT <= 21 &&
               THIRD_LIFT_PORT != LIFT_ROTATION_PORT && THIRD_LIFT_PORT != ARM_MOTOR_PORT &&
               THIRD_LIFT_PORT != FLEX_LEFT_PORT && THIRD_LIFT_PORT != FLEX_RIGHT_PORT &&
               THIRD_LIFT_PORT != TOGGLE_PORT && THIRD_LIFT_PORT != TOGGLE_OTHER_PORT &&
-              THIRD_LIFT_PORT != 6 && THIRD_LIFT_PORT != 2 && THIRD_LIFT_PORT != 3 &&
+              THIRD_LIFT_PORT != 1 && THIRD_LIFT_PORT != 2 && THIRD_LIFT_PORT != 3 &&
               THIRD_LIFT_PORT != 4 && THIRD_LIFT_PORT != 5 && THIRD_LIFT_PORT != 7 &&
               THIRD_LIFT_PORT != 20,
               "Third lift port conflicts with an existing hardware assignment");
@@ -1566,12 +1566,13 @@ bool flex_available() {
 }
 bool toggle_available() {
   using namespace mechanism_config;
-  if (!TOGGLE_CONFIGURED || !new_motor_port_free(TOGGLE_PORT)) return false;
-  if (FLEX_CONFIGURED && (TOGGLE_PORT == FLEX_LEFT_PORT || TOGGLE_PORT == FLEX_RIGHT_PORT)) return false;
-  if (TOGGLE_SINGLE_MOTOR_TEST) return true; // Secondary port is deliberately unassigned.
-  return new_motor_port_free(TOGGLE_OTHER_PORT) && TOGGLE_PORT != TOGGLE_OTHER_PORT &&
-      (!FLEX_CONFIGURED || (TOGGLE_OTHER_PORT != FLEX_LEFT_PORT && TOGGLE_OTHER_PORT != FLEX_RIGHT_PORT));
-}bool flex_intake(int power) { return flex_command(power, 1); }
+  return TOGGLE_CONFIGURED && new_motor_port_free(TOGGLE_PORT) &&
+         (!FLEX_CONFIGURED || (TOGGLE_PORT != FLEX_LEFT_PORT && TOGGLE_PORT != FLEX_RIGHT_PORT)) &&
+         (TOGGLE_SINGLE_MOTOR_TEST ||
+          (new_motor_port_free(TOGGLE_OTHER_PORT) && TOGGLE_PORT != TOGGLE_OTHER_PORT &&
+           (!FLEX_CONFIGURED || (TOGGLE_OTHER_PORT != FLEX_LEFT_PORT && TOGGLE_OTHER_PORT != FLEX_RIGHT_PORT))));
+}
+bool flex_intake(int power) { return flex_command(power, 1); }
 bool flex_outtake(int power) { return flex_command(power, -1); }
 bool flex_stop() {
   if (!flex_available()) return false;
@@ -1581,7 +1582,7 @@ bool flex_stop() {
 }
 namespace {
 // ----- Toggle pair -----
-// Single-motor mode commands only P19; dual mode requires validated assigned ports.
+// Single-motor test commands only P19; otherwise the validated mirrored pair shares a command.
 bool toggle_command(bool reverse) {
   if (!toggle_available()) return false;
   if (pros::competition::is_disabled() || TOGGLE_POWER < 1 || TOGGLE_POWER > 127 ||
@@ -1604,7 +1605,7 @@ bool pulse_toggle() {
   bool ok = !ez::autonomous_cancelled() && toggle_connected() && toggle_run();
   while (ok && pros::millis() - began < 395) {
     ok = !ez::autonomous_cancelled() && toggle_connected();
-    if (ok) {
+    if (ok) {     
       const unsigned elapsed = pros::millis() - began;
       if (elapsed < 395) pros::delay(395 - elapsed < 5 ? 395 - elapsed : 5);
     }
@@ -1794,12 +1795,12 @@ bool toggle_connected() {
         return p19_connected;
     }
 
-    static pros::Motor secondary_check(
+    static pros::Motor p6_check(
         mechanism_config::TOGGLE_OTHER_PORT,
         pros::v5::MotorGears::green
     );
 
-    return p19_connected && secondary_check.is_installed();
+    return p19_connected && p6_check.is_installed();
 }
 
 // ----- Route hardware snapshot -----

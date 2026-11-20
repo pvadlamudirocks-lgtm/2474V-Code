@@ -1,3 +1,4 @@
+#include "boomerang_motion_trace.hpp"
 #include "dev_tests.hpp"
 #include "nav_sequence.hpp"
 #include "subsystems.hpp"
@@ -372,6 +373,7 @@ void nav_cancel_sequence() {
   ez::wait_service_set(nullptr); ez::command_observer_set(nullptr);
   ez::drive_stop(&chassis);
   reverse_right_diag_cancel_capture(); // Teardown after the existing drive stop.
+  boomerang_motion_trace_cancel();
   ez::native_odom_exit_observer_set(nullptr);
   stop_all_mechanisms();
   if (active) { fault = "competition mode changed"; chassis.pid_print_toggle(print_before); }

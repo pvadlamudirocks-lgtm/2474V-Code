@@ -2,6 +2,7 @@
 #pragma once
 #include "api.h"
 #include "lift_calibration.hpp"
+#include "auton_auto_clamp_state.hpp"
 
 // All wiring and calibration choices live here. Validation is documented per item.
 namespace mechanism_config {
@@ -23,6 +24,18 @@ constexpr bool ARM_CONFIGURED = false;
 constexpr int ARM_MOTOR_PORT = 17;
 constexpr int ARM_ROTATION_PORT = 0; // Retired P18 sensor remains unbound.
 constexpr int CLAW_DISTANCE_PORT = 0; // Retired P19 sensor remains unbound.
+
+// Autonomous object-region clamp: unknown hardware/calibration stays unconfigured.
+// Reuses CLAW_DISTANCE_PORT and its existing compile-time port uniqueness check.
+constexpr bool ENABLE_AUTON_AUTO_CLAMP = false;
+constexpr bool AUTON_AUTO_CLAMP_RANGE_CALIBRATED = false;
+constexpr bool AUTON_AUTO_CLAMP_POLARITY_VERIFIED = false; // Verify semantic open/close after rebuild.
+constexpr int AUTON_AUTO_CLAMP_MIN_MM = 0;
+constexpr int AUTON_AUTO_CLAMP_MAX_MM = 0;
+constexpr unsigned AUTON_AUTO_CLAMP_READINGS = 0; // Must be at least two.
+constexpr unsigned AUTON_AUTO_CLAMP_SAMPLE_MS = 0;
+constexpr unsigned AUTON_AUTO_CLAMP_FRESHNESS_MS = 0;
+constexpr unsigned AUTON_AUTO_CLAMP_TIMEOUT_MS = 0; // Finite armed window required.
 // Downward sensor: builders must supply an unused Smart Port. 0 disables it.
 constexpr int LIFT_HEIGHT_DISTANCE_PORT = 0;
 // Set true ONLY after verifying the beam stays vertically downward through travel.
@@ -169,8 +182,8 @@ constexpr double LIFT_HOLD_KP = 80.0;
 constexpr double LIFT_HOLD_KD = 0.0;
 constexpr double ARM_HOLD_KP = 60.0;
 constexpr double ARM_HOLD_KD = 0.0;
-constexpr int LIFT_MANUAL_MV = 1500; // Keep low for the lift direction test; external gearing is 1:1.
-constexpr int ARM_MANUAL_MV = 1500;
+constexpr int LIFT_MANUAL_MV = 12000; // Keep low for the lift direction test; external gearing is 1:1.
+constexpr int ARM_MANUAL_MV = 12000;
 constexpr int LIFT_CLOSED_LOOP_MAX_MV = 12000;
 constexpr int ARM_CLOSED_LOOP_MAX_MV = 2000;
 constexpr double LIFT_TARGET_TOLERANCE_DEG = 2.0; // TODO TUNE.
@@ -336,3 +349,12 @@ void claw_driver_control(bool flex_held, bool claw_new_press);
 bool pickup_prepare(int power = mechanism_config::FLEX_INTAKE_POWER); // Open + intake.
 bool pickup_capture(int power = mechanism_config::FLEX_INTAKE_POWER); // Close + intake.
 bool pickup_finish();  // Stop flex; keep pneumatic state.
+
+// Autonomous caller owns arm/update; lifecycle cleanup may disarm concurrently.
+// Status describes commanded closure, NOT physical capture. Fault latches until reboot.
+bool auton_auto_clamp_arm();
+void auton_auto_clamp_disarm();
+void auton_auto_clamp_update();
+bool auton_auto_clamp_triggered();
+auto_clamp::State auton_auto_clamp_state();
+const char* auton_auto_clamp_reason(); // Static diagnostic string; no terminal IO in update.

@@ -9,6 +9,7 @@ file, You can obtain one at http://mozilla.org/MPL/2.0/.
 #include "pros/misc.hpp"
 #include "EZ-Template/path_trace_hook.hpp"
 #include <atomic>
+#include "EZ-Template/motion_output_safety.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
 
 namespace {
@@ -17,6 +18,8 @@ std::atomic<ez::CommandObserver> command_observer{nullptr};
 std::atomic<ez::DriveTelemetryObserver> drive_telemetry_observer{nullptr};
 pros::Mutex navigation_mutex; // Short controller/vector mutation serialization only.
 std::atomic<bool> emergency_stop{false};
+ez::output_safety::Latch output_fault;
+ez::output_safety::DriverOutputPermission driver_output_permission;
 std::atomic<ez::Drive*> turn_trace_drive{nullptr};
 ez::TurnOutputTrace turn_trace;
 void trace_zero(ez::Drive* drive, const char* reason) {
@@ -86,7 +89,20 @@ bool ez::geometry_turn_deadline_stopped(Drive* drive) {
   return geometry_drive.load() == drive &&
          (result == geometry_turn::Result::Timeout || result == geometry_turn::Result::Interrupted || result == geometry_turn::Result::SensorFault);
 }
-void ez::autonomous_begin() { emergency_stop.store(false); }
+void ez::motion_output_fault(output_safety::Fault reason) {
+  // Also covers manually dispatched native tests that did not change competition flags.
+  driver_output_permission.revoke();
+  output_fault.set(reason); emergency_stop.store(true);
+}
+ez::output_safety::Fault ez::motion_output_fault_get() { return output_fault.get(); }
+bool ez::driver_output_authorized() { return driver_output_permission.get(); }
+void ez::driver_control_ready() {
+  driver_output_permission.driver_ready(pros::competition::is_autonomous(), pros::competition::is_disabled());
+}
+void ez::autonomous_begin() {
+  driver_output_permission.revoke();
+  output_fault.reset(); emergency_stop.store(false);
+}
 void ez::autonomous_emergency_stop() { emergency_stop.store(true); }
 bool ez::autonomous_cancelled() {
   const bool autonomous=pros::competition::is_autonomous();
@@ -125,6 +141,7 @@ void Drive::ez_auto_task() {
 }
 // Drive PID task
 void Drive::drive_pid_task() {
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   // Compute PID
   leftPID.compute(drive_sensor_left());
   rightPID.compute(drive_sensor_right());
@@ -134,6 +151,7 @@ void Drive::drive_pid_task() {
   // Compute slew
   slew_left.iterate(drive_sensor_left());
   slew_right.iterate(drive_sensor_right());
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
 
   // Left and Right outputs
   double l_drive_out = leftPID.output;
@@ -162,6 +180,10 @@ void Drive::drive_pid_task() {
     r_out *= (max_slew_out / faster_side);
   }
 
+  // Validate before implicit floating-to-integer conversion.
+  if(!std::isfinite(l_out)||!std::isfinite(r_out) || std::abs(l_out)>std::numeric_limits<int>::max() || std::abs(r_out)>std::numeric_limits<int>::max()) {
+    motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return;
+  }
   // Set motors
   if (drive_toggle)
     private_drive_set(l_out, r_out);
@@ -171,6 +193,7 @@ void Drive::drive_pid_task() {
 
 // Turn PID task
 void Drive::turn_pid_task() {
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   // Compute PID if it's a normal turn
   if (mode == TURN) {
     turnPID.compute(drive_imu_get());
@@ -185,6 +208,7 @@ void Drive::turn_pid_task() {
 
   // Compute slew
   slew_turn.iterate(drive_imu_get());
+  if (motion_output_fault_get()!=output_safety::Fault::None || !std::isfinite(turnPID.output)) { motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return; }
 
   // Clip gyroPID to max speed
   double gyro_out = util::clamp(turnPID.output, slew_turn.output(), -slew_turn.output());
@@ -223,6 +247,7 @@ void Drive::turn_pid_task() {
 
 // Swing PID task
 void Drive::swing_pid_task() {
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   // Compute PID
   swingPID.compute(drive_imu_get());
   leftPID.compute(drive_sensor_left());
@@ -231,6 +256,7 @@ void Drive::swing_pid_task() {
   // Compute slew
   double current = slew_swing_using_angle ? drive_imu_get() : (current_swing == LEFT_SWING ? drive_sensor_left() : drive_sensor_right());
   slew_swing.iterate(current);
+  if (motion_output_fault_get()!=output_safety::Fault::None || !std::isfinite(swingPID.output)) { motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return; }
 
   // Clip swingPID to max speed
   double swing_out = util::clamp(swingPID.output, slew_swing.output(), -slew_swing.output());
@@ -248,10 +274,16 @@ void Drive::swing_pid_task() {
     // Check if left or right swing, then set motors accordingly
     if (current_swing == LEFT_SWING) {
       opposite_output = swing_opposite_speed == 0 ? rightPID.output : (swing_opposite_speed * scale);
+      if(!std::isfinite(swing_out)||!std::isfinite(opposite_output) || std::abs(swing_out)>std::numeric_limits<int>::max() || std::abs(opposite_output)>std::numeric_limits<int>::max()) {
+        motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return;
+      }
       private_drive_set(swing_out, opposite_output);
   if (drive_toggle) if (auto observer = command_observer.load()) observer(this, swing_out, opposite_output);
     } else if (current_swing == RIGHT_SWING) {
       opposite_output = swing_opposite_speed == 0 ? leftPID.output : -(swing_opposite_speed * scale);
+      if(!std::isfinite(swing_out)||!std::isfinite(opposite_output) || std::abs(swing_out)>std::numeric_limits<int>::max() || std::abs(opposite_output)>std::numeric_limits<int>::max()) {
+        motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return;
+      }
       private_drive_set(opposite_output, -swing_out);
   if (drive_toggle) if (auto observer = command_observer.load()) observer(this, opposite_output, -swing_out);
     }
@@ -260,11 +292,18 @@ void Drive::swing_pid_task() {
 
 // Odom To Point Task
 void Drive::ptp_task() {
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   // Compute slew
   slew_left.iterate(drive_sensor_left());
   slew_right.iterate(drive_sensor_right());
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   double max_slew_out = fmax(slew_left.output(), slew_right.output());
 
+  const auto pose_now=odom_pose_get();
+  if(point_to_face.size()<2 || !std::isfinite(pose_now.x) || !std::isfinite(pose_now.y) ||
+     !std::isfinite(pose_now.theta) || !std::isfinite(odom_target.x) || !std::isfinite(odom_target.y) ||
+     !std::isfinite(xy_delta_fake) || !std::isfinite(new_current_fake) || !std::isfinite(past_target) ||
+     !std::isfinite(odom_imu_start) || !output_safety::pose_valid(point_to_face[0]) || !output_safety::pose_valid(point_to_face[1])) { motion_output_fault(output_safety::Fault::State); drive_set(0,0); return; }
   // Decide if we've past the target or not
   double temp_target = is_past_target(odom_target, odom_pose_get());        // Use this instead of distance formula to fix impossible movements
   int dir = (current_drive_direction == REV ? -1 : 1);                      // If we're going backwards, add a -1
@@ -282,36 +321,16 @@ void Drive::ptp_task() {
   current_a_odomPID.compute_error(wrapped_a_target, odom_theta_get());
   // printf("shortest_a_target: %.2f      error: %.2f\n", a_target, wrapped_a_target);
 
-  // Prioritize turning by scaling xy_out down
-  double xy_out = xyPID.output;
-  xy_out = util::clamp(xy_out, max_slew_out);
-  // double scale = cos(util::to_rad(current_a_odomPID.error)) / odom_turn_bias_amount;
-  double scale = 1.0 - ((1.0 - cos(util::to_rad(current_a_odomPID.error))) / odom_turn_bias_amount);  // 1 - ((1-0.7)/0.75)
-  const bool bias_enabled = odom_turn_bias_enabled();
-  if (bias_enabled)
-    xy_out *= scale;
-  double a_out = current_a_odomPID.output;
-  // a_out = util::clamp(a_out, max_slew_out);
-
-  // Scale xy_out and a_out to max speed
-  // this ensures no data is lost that would otherwise by lost in clamping
-  double faster_side = fmax(fabs(xy_out), fabs(a_out));
-  if (faster_side > max_slew_out) {
-    xy_out *= (max_slew_out / faster_side);
-    a_out *= (max_slew_out / faster_side);
+  const bool bias_enabled=odom_turn_bias_enabled();
+  const double scale=1.0-((1.0-cos(util::to_rad(current_a_odomPID.error)))/odom_turn_bias_amount);
+  const auto mixed=output_safety::mix(xyPID.output,current_a_odomPID.output,scale,bias_enabled,
+                                     slew_left.output(),slew_right.output(),max_speed);
+  if(!mixed.valid || !std::isfinite(temp_target) || !std::isfinite(past_target) ||
+     !std::isfinite(new_current_fake) || !std::isfinite(a_target) || !std::isfinite(wrapped_a_target)) {
+    motion_output_fault(output_safety::Fault::Output); drive_set(0,0); return;
   }
-
-  // Combine heading and drive
-  double l_out = xy_out + a_out;
-  double r_out = xy_out - a_out;
-
-  // Vector scaling when combining drive and imu
-  // this ensures no data is lost that would otherwise by lost in clamping
-  faster_side = fmax(fabs(l_out), fabs(r_out));
-  if (faster_side > max_slew_out) {
-    l_out *= (max_slew_out / faster_side);
-    r_out *= (max_slew_out / faster_side);
-  }
+  max_slew_out=mixed.limit;
+  const double xy_out=mixed.xy, a_out=mixed.angular, l_out=mixed.left, r_out=mixed.right;
 
   // printf("lr out (%.2f, %.2f)   xy/a(%.2f, %.2f)   lr slew (%.2f, %.2f)\n", l_out, r_out, xy_out, a_out, slew_left.output(), slew_right.output());
   // printf("max_slew_out %.2f      headingerr: %.2f\n", max_slew_out, aPID.error);
@@ -329,7 +348,7 @@ void Drive::ptp_task() {
   if (auto hook = path_trace_hook.load()) {
     hook(this, {temp_target, max_slew_out, scale, xy_out, a_out, l_out, r_out,
                 dir, flipped, drive_toggle, a_target, odom_target.x, odom_target.y,
-                odom_target.theta, bias_enabled});
+                odom_target.theta, bias_enabled, slew_left.enabled(), slew_right.enabled()});
   }
 
   // This is for wait_until
@@ -338,22 +357,24 @@ void Drive::ptp_task() {
 }
 
 void Drive::boomerang_task() {
+  if (pp_index<0 || static_cast<size_t>(pp_index)>=pp_movements.size()) {
+    motion_output_fault(output_safety::Fault::Path); drive_set(0,0); return;
+  }
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   int target_index = pp_index;
   pose target = pp_movements[target_index].target;
 
-  // target.theta += current_drive_direction == REV ? 180 : 0;  // Decide if going fwd or rev
-  int dir = current_drive_direction == REV ? -1 : 1;
-
-  double h = util::distance_to_point(target, odom_pose_get()) * odom_boomerang_dlead_get();
-  double max = max_boomerang_distance;
-  h = h > max ? max : h;
-  h *= dir;
-
-  pose temp = util::vector_off_point(-h, pp_movements[target_index].target);
-  temp.theta = target.theta;
-
-  if (util::distance_to_point(target, odom_pose_get()) < odom_look_ahead_get() / 2.0) {
-    temp = target;
+  const int dir=current_drive_direction==REV?-1:current_drive_direction==FWD?1:0;
+  pose temp;
+  if(!output_safety::boomerang_geometry(target,odom_pose_get(),odom_boomerang_dlead_get(),
+      max_boomerang_distance,odom_look_ahead_get(),dir,
+      [](pose a,pose b) { return util::distance_to_point(a,b); },
+      [](double distance,pose p) { return util::vector_off_point(distance,p); },temp)) {
+    // This is the existing motor owner, already under navigation_mutex.
+    // Publish cancellation first so all native pid_wait loops can return.
+    motion_output_fault(output_safety::Fault::State);
+    drive_set(0,0);
+    return;
   }
 
   if (odom_target.x != temp.x || odom_target.y != temp.y) {
@@ -367,6 +388,10 @@ void Drive::boomerang_task() {
 }
 
 void Drive::pp_task() {
+  if (pp_index<0 || static_cast<size_t>(pp_index)>=pp_movements.size()) {
+    motion_output_fault(output_safety::Fault::Path); drive_set(0,0); return;
+  }
+  if (motion_output_fault_get()!=output_safety::Fault::None) { drive_set(0,0); return; }
   if (fabs(util::distance_to_point(pp_movements[pp_index].target, odom_pose_get())) < odom_look_ahead_get()) {
     if (pp_index < pp_movements.size() - 1) {
       pp_index = pp_index >= pp_movements.size() - 1 ? pp_index : pp_index + 1;
@@ -416,4 +441,16 @@ void ez::turn_output_trace_exit(const PID* pid, const char* branch, double secon
     turn_trace.exit_l = l;
   }
   navigation_unlock();
+}
+
+bool ez::path_trace_hook_claim(PathTraceHook hook) {
+  PathTraceHook empty=nullptr;
+  return path_trace_hook.compare_exchange_strong(empty,hook);
+}
+void ez::path_trace_hook_release(PathTraceHook hook) {
+  path_trace_hook.compare_exchange_strong(hook,nullptr);
+}
+bool ez::autonomous_cancelled_snapshot() {
+  return emergency_stop.load() || pros::competition::is_disabled() ||
+      !pros::competition::is_autonomous();
 }

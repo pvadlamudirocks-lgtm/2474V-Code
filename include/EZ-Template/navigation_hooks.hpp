@@ -22,6 +22,9 @@ void navigation_unlock();
 namespace ez {
 // Basic lifecycle only; no sensor preflight, deadline, ownership gate or ACK.
 void drive_stop(Drive* drive); // Serialized native drive_set(0,0), disables PID.
+// Call only after opcontrol lifecycle cleanup has stopped PID and disarmed diagnostics.
+void driver_control_ready();
+bool driver_output_authorized();
 void autonomous_begin();      // Clear the B-button emergency latch for a new run.
 void autonomous_emergency_stop(); // Atomic request; controller performs stop.
 bool autonomous_cancelled();  // Competition mode/disable or autonomous-only B.
@@ -64,3 +67,5 @@ void native_odom_exit_observer_set(NativeOdomExitObserver observer);
 struct NativeOdomWaitResult { bool completed = false; int xy = -1, angular = -1; };
 NativeOdomWaitResult native_odom_wait_result(Drive* drive);
 }
+
+namespace ez { bool autonomous_cancelled_snapshot(); } // Read-only existing latch/mode; never polls or latches B.

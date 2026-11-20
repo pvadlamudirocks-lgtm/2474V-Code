@@ -1,3 +1,4 @@
+#include "boomerang_motion_trace.hpp"
 #include "navigation.hpp"
 #include "motion_exit_trace.hpp"
 #include "path_motion_trace.hpp"
@@ -153,6 +154,34 @@ void nav_go_to(double x_in, double y_in, int speed) {
               chassis.interfered,rested);
 }
 void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int speed) {
+
+  // Reject unsafe requests before starting Boomerang.
+  if (ez::autonomous_cancelled() ||
+      !start_reference_valid ||
+      !point_sensors_ready() ||
+      !chassis.pid_drive_toggle_get() ||
+      !std::isfinite(x_in) ||
+      !std::isfinite(y_in) ||
+      !std::isfinite(public_heading_deg) ||
+      speed < 1 || speed > 127) {
+
+    ez::drive_stop(&chassis);
+    std::printf("BOOMERANG REJECTED: preflight or arguments\n");
+    std::fflush(stdout);
+    return;
+  }
+
+  // Stop previous drive output before arming this movement.
+  ez::drive_stop(&chassis);
+
+  // Existing motor-owner-enforced 5000 ms deadline.
+  // No unverified sensor callback is used inside its mutex.
+  if (!ez::geometry_turn_deadline_arm(&chassis)) {
+    std::printf("BOOMERANG REJECTED: deadline unavailable\n");
+    std::fflush(stdout);
+    return;
+  }
+
   const auto target = nav_game_to_internal_pose({x_in, y_in, public_heading_deg});
   const ez::odom movement{target, ez::fwd, speed};  // FRONT-first, as in nav_go_to.
   const bool interfered_before = chassis.interfered;
@@ -161,12 +190,26 @@ void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int spe
               x_in, y_in, public_heading_deg, target.x, target.y, target.theta, speed);
   std::fflush(stdout);
   pose_exit_trace_begin();
+  boomerang_motion_trace_begin({x_in,y_in,public_heading_deg},speed);
   // Explicit single-pose API; uses the existing global slew/Boomerang settings.
+  boomerang_motion_trace_event(BoomerangTraceEvent::Dispatch);
   chassis.pid_odom_boomerang_set(movement);
   chassis.pid_wait();
+  boomerang_motion_trace_event(BoomerangTraceEvent::WaitReturned);
+  boomerang_motion_trace_event(BoomerangTraceEvent::StopRequested);
   ez::drive_stop(&chassis);
+  boomerang_motion_trace_event(BoomerangTraceEvent::StopReturned);
+
+  const auto deadline_result =
+      ez::geometry_turn_deadline_result();
+
+  std::printf("BOOMERANG DEADLINE RESULT: %d\n",
+              static_cast<int>(deadline_result));
+  std::fflush(stdout);
+
   const auto final_pose = nav_pose_get();
   const auto exits = pose_exit_trace_finish();
+  boomerang_motion_trace_finish();
   std::printf("POSE final PUBLIC = (%.3f, %.3f, %.3f deg) [at pid_wait return]\n"
               "POSE position error = %.3f in | heading error (target-current) = %+.3f deg\n"
               "POSE exit XY = %s | angular = %s | interference before/after = %s/%s\n",
@@ -177,6 +220,7 @@ void nav_go_to_pose(double x_in, double y_in, double public_heading_deg, int spe
               ez::exit_to_string(exits.second).c_str(),
               interfered_before ? "true" : "false", chassis.interfered ? "true" : "false");
   std::fflush(stdout);
+  // Recorder reports only on an explicit post-trial report request.
 }
 
 void nav_go_to_reverse(double x_in, double y_in, int speed) {

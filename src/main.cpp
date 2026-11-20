@@ -13,6 +13,7 @@
 #include "autons.hpp"
 #include "dev_tests.hpp"
 #include "navigation.hpp"
+#include "boomerang_motion_trace.hpp"
 #include "nav_diagnostics.hpp"
 #include "nav_sequence.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
@@ -317,7 +318,8 @@ void initialize() {
   static pros::Task live_display(odom_display_task, TASK_PRIORITY_MIN,
                                  TASK_STACK_DEPTH_DEFAULT, "Live coordinates");
   (void)live_display;
-}
+
+  }
 
 
 void disabled() {
@@ -348,22 +350,52 @@ static_assert(!(RUN_DEV_TEST && RUN_CUSTOM_AUTON_TEST), "Select only one develop
 
 void custom_auton_test() {
   const unsigned began = pros::millis();
-  bool ok = claw_open();  // Physically CLOSE claw.
+  //bool ok = claw_open();  // Physically CLOSE claw.
   // if (ok) ok = pulse_toggle();  // Existing 395 ms pulse.
   // if (ok) ok = lift_boomerang_to(514, 19.42, 7.58, 54.14, 40);
   // if (ok) ok = preload_lower_for_release(32, 2000);
   // if (ok) ok = claw_close();  // Physically OPEN claw.
   // preload_auton_finish_log(began, ok);
-    nav_go_to_pose(19.94, 6.93, 56.83, 110);
+const bool recording = boomerang_motion_trace_arm(10016);
 
 
+std::printf("BOOM DLEAD TEST: speed=70 dlead=0.50 recorder=%d\n",
+            recording);
+std::fflush(stdout);
 
-
-  
+if (!recording) {
+    std::printf("BOOM DLEAD TEST: recorder unavailable, movement cancelled\n");
+    std::fflush(stdout);
+    return;
 }
+
+
+nav_go_to_pose(20.66, 8.15, 67.58, 70);
+const bool report_ok = boomerang_motion_trace_report();
+
+std::printf("BOOM DLEAD TEST: report result=%d\n", report_ok);
+std::fflush(stdout);
+
+
+}
+
 void autonomous() {
-  std::printf("AUTON ENTERED\n");
-                
+    // Temporary diagnostic disabled.
+    constexpr bool RUN_STATIONARY_TEST = false;
+
+    std::printf("AUTON BUILD CHECK: BOOMERANG ENABLED V1\n");
+    std::fflush(stdout);
+
+    if (RUN_STATIONARY_TEST) {
+        std::printf("AUTON DRIVE TEST PAUSED\n");
+        std::fflush(stdout);
+        return;
+    }
+
+    // Keep the rest of your existing autonomous() code
+    // below this point unchanged.
+
+    std::printf("AUTON ENTERED\n");                
   ez::drive_stop(&chassis);
   ez::autonomous_begin();  // ----- Autonomous dispatch -----
   // Each development branch returns here so it cannot also run a competition route.
@@ -410,6 +442,7 @@ void opcontrol() {
   // This loop owns driver motor commands and services the mechanism state machines.
 
   auton::lifecycle_stop("opcontrol");
+  ez::driver_control_ready(); // Authorize driver output only after existing cleanup returns.
   development_mode = pose_recorder::enabled ? "POSE RECORDER" : "DRIVER";
   show_live_odometry();
   chassis.drive_brake_set(MOTOR_BRAKE_BRAKE);
