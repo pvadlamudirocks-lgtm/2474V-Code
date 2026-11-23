@@ -1,4 +1,3 @@
-
 #include "subsystems.hpp"
 #include "lift_calibration.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
@@ -6,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <cerrno>
+#include <cstdint>
 
 namespace {
 using namespace mechanism_config;
@@ -48,7 +49,7 @@ pros::Motor& arm_motor() {
   return motor;
 }
 pros::Rotation& lift_sensor() {
-  static pros::Rotation sensor(LIFT_ROTATION_REVERSED ? -LIFT_ROTATION_PORT : LIFT_ROTATION_PORT);
+  static pros::Rotation sensor(LIFT_ROTATION_PORT); // V6 always use a positive port.
   return sensor;
 }
 pros::Rotation& arm_sensor() {
@@ -170,32 +171,69 @@ bool object_detected = false;
 unsigned object_readings = 0;
 unsigned last_distance_sample = 0;
 
+// P16 has one software sign; native reversal must be confirmed off before use.
+bool p16_native_ready = false;
+std::int32_t p16_last_raw = PROS_ERR;
+int p16_last_read_errno = 0;
 // In these small shared helpers, is_lift=true selects lift; false selects arm.
 double read_position(bool is_lift) {
   // Never construct the retired arm sensor on an unbound port.
   if (!is_lift && (ARM_ROTATION_PORT < 1 || ARM_ROTATION_PORT > 21)) return NAN;
   const double ratio = is_lift ? LIFT_SENSOR_DEG_PER_MECHANISM_DEG : ARM_SENSOR_DEG_PER_MECHANISM_DEG;
+  if (is_lift && !p16_native_ready) return NAN;
+  if (is_lift) errno = 0;
   const auto raw = is_lift ? lift_sensor().get_position() : arm_sensor().get_position();
+  if (is_lift) {
+    p16_last_raw = raw;
+    p16_last_read_errno = errno;
+    if (p16_last_read_errno != 0) return NAN;
+  }
   if (raw == PROS_ERR || !std::isfinite(ratio) || ratio <= 0.0)
     return std::numeric_limits<double>::quiet_NaN();
   // Installed PROS returns signed accumulated CENTIDEGREES, not degrees.
   // get_position does not wrap every revolution like get_angle does.
-  return static_cast<double>(raw) / 100.0 / ratio;
+  // V6 P16: One software sign correction, independent of PROS port reversal.
+  // Positive angle means physically UP; zero remains the verified home position.
+  const double normalized_raw = static_cast<double>(raw) *
+      (is_lift ? mechanism_config::LIFT_P16_SOFTWARE_SIGN : 1.0);
+  return normalized_raw / 100.0 / ratio;
 }
 
+// Diagnostic-only records, emitted by the existing throttled debug printer.
+// Never change authorization, control state, voltages, or return values.
+struct LiftPathTrace { const char* reason="NONE"; int requested=0; double position=NAN; unsigned at=0,serial=0; };
+LiftPathTrace lift_path_trace[3]; // FULL request, WRITE guard, periodic UPDATE
+void trace_lift_path(unsigned slot,const char* reason,int requested,double position=NAN) {
+  auto& t=lift_path_trace[slot];t.reason=reason;t.requested=requested;t.position=position;t.at=pros::millis();++t.serial;
+}
+struct LiftWriteTrace { int mv=0; long result[3]{}; int error[3]{}; bool fallback=false; unsigned at=0,serial=0; };
+LiftWriteTrace lift_write_trace, lift_failed_write, lift_powered_write;
+void trace_lift_write(int mv,long p13,long p14,long p15,int e13,int e14,int e15,bool fallback=false) {
+  lift_write_trace.mv=mv;lift_write_trace.result[0]=p13;lift_write_trace.result[1]=p14;lift_write_trace.result[2]=p15;
+  lift_write_trace.error[0]=e13;lift_write_trace.error[1]=e14;lift_write_trace.error[2]=e15;
+  lift_write_trace.fallback=fallback;lift_write_trace.at=pros::millis();++lift_write_trace.serial;
+  if(mv!=0)lift_powered_write=lift_write_trace;
+  if(p13==PROS_ERR||p14==PROS_ERR||p15==PROS_ERR)lift_failed_write=lift_write_trace;
+}
 // Shared lift output: positive command = UP. P13 uses P15's motor
 // polarity and P15's -up_mv command; confirm actual shaft direction first.
 bool write_lift_pair(int up_mv) {
+  if ((LIFT_MOTOR_SAFETY_LOCKOUT || ENABLE_LIFT_DIRECTION_DIAGNOSTIC) && up_mv != 0) {
+    trace_lift_path(1,"LOCKOUT",up_mv);
+    write_lift_pair(0); // Same writer; never allow a preset/manual path to energize the lift.
+    return false;
+  }
     // Preserve calibrated lift limits when enabled.
   if (up_mv != 0 && lift_calibration::enable_limits) {
     if (!auton_math::lift_direction_allowed(
             lift_calibration::limits,
             read_position(true),
-            up_mv > 0 ? 1 : -1))    
+            up_mv > 0 ? 1 : -1)) {
+      trace_lift_path(1,"CALIBRATION_DIRECTION_LIMIT",up_mv);
       up_mv = 0;
+    }
 
-    if (!lift.homed)
-      up_mv = 0;
+    if (!lift.homed) {trace_lift_path(1,"PAIR_NOT_HOMED",up_mv);up_mv = 0;}
   }
   // Check the physical ports using positive port numbers.
 // Workaround for reversed-motor is_installed() bug in PROS 4.1.1.
@@ -208,25 +246,47 @@ if (up_mv != 0) {
       !p14_check.is_installed() ||
       !p15_check.is_installed()) {
 
-    left_lift_motor().move_voltage(0);
-    right_lift_motor().move_voltage(0);
-    third_lift_motor().move_voltage(0);
+    trace_lift_path(1,"MOTOR_DISCONNECTED",up_mv);
+    errno=0; const auto stop14=left_lift_motor().move_voltage(0); const int err14=errno;
+    errno=0; const auto stop15=right_lift_motor().move_voltage(0); const int err15=errno;
+    errno=0; const auto stop13=third_lift_motor().move_voltage(0); const int err13=errno;
+    trace_lift_write(0,stop13,stop14,stop15,err13,err14,err15,true);
 
     lift_output_fault = true;
     return false;
   }
 }
 
+  // Diagnostic evidence for the exact program that reaches the motor API.
+  // Print only on command changes, never every 10-ms driver update.
+  static int last_logged_voltage = -13001;
+  if (up_mv != last_logged_voltage) {
+    last_logged_voltage = up_mv;
+    std::printf("LIFT_MOTOR_WRITE_V6 up_mv=%+d P13=%+d P14=%+d P15=%+d\n",
+                up_mv,
+                (THIRD_LIFT_REVERSED ? -1 : 1) * up_mv,
+                (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv,
+                (RIGHT_LIFT_REVERSED ? -1 : 1) * up_mv);
+    std::fflush(stdout);
+  }
+
+  errno=0;
   const auto left = left_lift_motor().move_voltage(
       (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv);
+  const int error14=errno;
 
+  errno=0;
   const auto right = right_lift_motor().move_voltage(
       (RIGHT_LIFT_REVERSED ? -1 : 1) * up_mv);
+  const int error15=errno;
 
       
 
+errno=0;
 const auto third = third_lift_motor().move_voltage(
     (mechanism_config::THIRD_LIFT_REVERSED ? -1 : 1) * up_mv);
+const int error13=errno;
+trace_lift_write(up_mv,third,left,right,error13,error14,error15);
 
 // All three motor commands must succeed.
 if (left != PROS_ERR &&
@@ -237,9 +297,11 @@ if (left != PROS_ERR &&
 
 // A motor command failed.
 // Attempt to stop ALL three lift motors.
-left_lift_motor().move_voltage(0);
-right_lift_motor().move_voltage(0);
-third_lift_motor().move_voltage(0);
+trace_lift_path(1,"MOTOR_WRITE_FAILED",up_mv);
+errno=0;const auto stop14=left_lift_motor().move_voltage(0);const int err14=errno;
+errno=0;const auto stop15=right_lift_motor().move_voltage(0);const int err15=errno;
+errno=0;const auto stop13=third_lift_motor().move_voltage(0);const int err13=errno;
+trace_lift_write(0,stop13,stop14,stop15,err13,err14,err15,true);
 
 lift_output_fault = true;
 return false;
@@ -260,6 +322,7 @@ bool write_voltage(bool is_lift, int mv) {
 
   // Do not move before establishing a valid home reference.
   if (!lift.initialized || !lift.homed) {
+    trace_lift_path(1,!lift.initialized?"NOT_INITIALIZED":"NOT_HOMED",mv);
     return write_lift_pair(0);
   }
 
@@ -267,6 +330,7 @@ bool write_voltage(bool is_lift, int mv) {
   const double position = read_position(true);
 
   if (!std::isfinite(position)) {
+    trace_lift_path(1,"INVALID_P16",mv,position);
     write_lift_pair(0);
     return false;
   }
@@ -289,6 +353,7 @@ if (mv > 0) {
 
     if ((max_known && position >= max_safe) ||
         (!max_known && !calibration_driver)) {
+        trace_lift_path(1,max_known?"UPPER_LIMIT":"UNKNOWN_UPPER_LIMIT",mv,position);
         return write_lift_pair(0);
     }
 }
@@ -298,6 +363,7 @@ if (mv > 0) {
     const auto bottom = lift_bottom_limit_read();
 
     if (bottom == LiftBottomLimit::Fault) {
+      trace_lift_path(1,"BOTTOM_READ_FAULT",mv,position);
       write_lift_pair(0);
       return false;
     }
@@ -306,6 +372,7 @@ if (mv > 0) {
    
     if (bottom == LiftBottomLimit::Pressed ||
         position <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG) {
+        trace_lift_path(1,bottom==LiftBottomLimit::Pressed?"BOTTOM_PRESSED":"LOWER_LIMIT",mv,position);
         return write_lift_pair(0);
     }
 
@@ -338,6 +405,25 @@ if (is_lift) {
   return stopped;
 }
 
+// Expected policy rejection, distinct from hardware/control failure. Never clear a fault.
+bool reject_lift_lockout() {
+  if (!LIFT_MOTOR_SAFETY_LOCKOUT && !ENABLE_LIFT_DIRECTION_DIAGNOSTIC) return false;
+  const bool prior_fault = lift.mode == AxisMode::Fault || lift_output_fault;
+  const char* prior_reason = lift.auton_reason;
+  const bool sensor_fault = !std::isfinite(read_position(true));
+  const bool connected = left_lift_motor().is_installed() &&
+      right_lift_motor().is_installed() && third_lift_motor().is_installed();
+  if (!connected) lift_output_fault = true;
+  const bool stopped = write_lift_pair(0); // Always attempt a real stop, even before initialization.
+  disable_axis(lift, true, prior_fault || sensor_fault || !connected || !stopped);
+  if (!stopped || lift_output_fault)
+    lift.auton_reason = connected ? "MOTOR_WRITE_FAULT" : "MOTOR_DISCONNECTED";
+  else if (sensor_fault) lift.auton_reason = "SENSOR_FAULT";
+  else if (prior_fault) lift.auton_reason = prior_reason; // Preserve historical fault evidence.
+  else lift.auton_reason = "LOCKED_OUT";
+  return true; // Request rejected, regardless of whether stopping succeeded.
+}
+
 bool feedback_ready(const AxisState& axis, bool is_lift) {
   return axis.initialized && axis.homed && axis.mode != AxisMode::Fault &&
          (is_lift ? LIFT_FEEDBACK_VERIFIED : ARM_FEEDBACK_VERIFIED);
@@ -352,6 +438,22 @@ bool limits_ready(bool is_lift) {
 void initialize_axis(AxisState& axis, bool is_lift) {
   axis = AxisState{}; // Discard old targets; startup position is NOT software zero.
   axis.initialized = true;
+  bool native_config_ok = true;
+  if (is_lift) {
+      p16_native_ready = false;
+      // Setter acknowledgement is not verification of the effective native flag.
+      errno = 0;
+      const auto result = lift_sensor().set_reversed(false);
+      const int set_error = errno;
+      errno = 0;
+      const auto actual = lift_sensor().get_reversed();
+      const int get_error = errno;
+      native_config_ok = result == 1 && set_error == 0 && actual == 0 && get_error == 0;
+      p16_native_ready = native_config_ok;
+      std::printf("P16_CONFIG_V6 native_reverse_requested=0 native_reverse_actual=%ld result=%ld set_errno=%d get_errno=%d software_sign=%+.0f verified=%d\n",
+                  static_cast<long>(actual), static_cast<long>(result), set_error, get_error,
+                  mechanism_config::LIFT_P16_SOFTWARE_SIGN, native_config_ok);
+  }
   bool brakes_ok;
   if (is_lift) {
     const auto left_result = left_lift_motor().set_brake_mode(pros::E_MOTOR_BRAKE_BRAKE);
@@ -366,7 +468,10 @@ void initialize_axis(AxisState& axis, bool is_lift) {
   const double position = read_position(is_lift);
   axis.last_update = pros::millis();
   axis.previous_position = position;
-  if (!brakes_ok || !stopped || !std::isfinite(position)) disable_axis(axis, is_lift, true);
+  if (!native_config_ok || !brakes_ok || !stopped || !std::isfinite(position)) {
+    disable_axis(axis, is_lift, true);
+    if (is_lift && !native_config_ok) axis.auton_reason = "P16_NATIVE_CONFIG_FAILED";
+  }
 }
 
 // ----- Physical home reference -----
@@ -396,6 +501,7 @@ bool zero_axis(AxisState& axis, bool is_lift) {
 }
 
 void capture_hold(AxisState& axis, bool is_lift) {
+  if (is_lift && reject_lift_lockout()) return;
   if (is_lift && lift_output_owner != LiftOutputOwner::None) return;
   if (is_lift && returning_home) return;
   axis.preload_crossing = false;
@@ -431,6 +537,7 @@ int limit_voltage(const AxisState& axis, bool is_lift, double position, int mv) 
 // ----- Low-voltage manual control -----
 // Held commands must be refreshed; this is separate from the full-voltage driver test.
 void manual_axis(AxisState& axis, bool is_lift, int direction) {
+  if (is_lift && reject_lift_lockout()) return;
   if (pros::competition::is_disabled()) {
     disable_axis(axis, is_lift, axis.mode == AxisMode::Fault);
     return;
@@ -479,6 +586,7 @@ return !(is_lift &&
 }
 bool set_target(AxisState& axis, bool is_lift, double target,
                 unsigned timeout_ms = TARGET_TIMEOUT_MS) {
+  if (is_lift && reject_lift_lockout()) return false;
   if (pros::competition::is_disabled() || timeout_ms == 0) return false;
   if (!target_allowed(axis, is_lift, target)) return false;
   const double position = read_position(is_lift);
@@ -508,6 +616,7 @@ bool preload_target_reached(double position, double target, int direction) {
 }
 
 void update_axis(AxisState& axis, bool is_lift) {
+  if (is_lift && axis.mode != AxisMode::Disabled && axis.mode != AxisMode::Fault && reject_lift_lockout()) return;
   if (!axis.initialized ||
       axis.mode == AxisMode::Disabled ||
       axis.mode == AxisMode::Fault) return;
@@ -849,6 +958,7 @@ namespace {
 bool lift_full_command(
     int direction,
     LiftOutputOwner owner) {
+    if (reject_lift_lockout()) {trace_lift_path(0,"LOCKOUT",direction*LIFT_COMMISSIONING_MV);return false;}
 
     const bool enabled =
         !pros::competition::is_disabled() &&
@@ -871,6 +981,20 @@ bool lift_full_command(
         returning_home ||
         (direction != 1 && direction != -1)) {
 
+        trace_lift_path(0,!enabled?"MODE_DISABLED_OR_MISMATCH":
+          (!LIFT_LIMITS_CALIBRATED&&!calibration_driver)?"LIMITS_UNCALIBRATED":
+          !lift.initialized?"NOT_INITIALIZED":!lift.homed?"NOT_HOMED":
+          lift.mode==AxisMode::Fault?"AXIS_FAULT":lift_output_fault?"OUTPUT_FAULT":
+          returning_home?"RETURN_HOME_ACTIVE":"INVALID_DIRECTION",direction*LIFT_COMMISSIONING_MV);
+        static unsigned last_reject_report = 0;
+        const unsigned now = pros::millis();
+        if (now - last_reject_report >= 500) {
+            last_reject_report = now;
+            std::printf("LIFT_REJECT_V6 enabled=%d limits=%d init=%d homed=%d fault=%d output_fault=%d home_busy=%d dir=%d\n",
+                        enabled, LIFT_LIMITS_CALIBRATED, lift.initialized,
+                        lift.homed, lift.mode == AxisMode::Fault,
+                        lift_output_fault, returning_home, direction);
+        }
         lift_auton_stop();
         return false;
     }
@@ -888,6 +1012,15 @@ bool lift_full_command(
         (direction < 0 &&
          current_deg <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG)) {
 
+        trace_lift_path(0,!std::isfinite(current_deg)?"INVALID_P16":direction<0?"LOWER_LIMIT":max_known?"UPPER_LIMIT":"UNKNOWN_UPPER_LIMIT",direction*LIFT_COMMISSIONING_MV,current_deg);
+        static unsigned last_limit_report = 0;
+        const unsigned now = pros::millis();
+        if (now - last_limit_report >= 500) {
+            last_limit_report = now;
+            std::printf("LIFT_LIMIT_STOP_V6 direction=%+d P16=%.2f lower_margin=%.2f max=%.2f\n",
+                        direction, current_deg,
+                        mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG, max_safe);
+        }
         lift_auton_stop();
         return false;
     }
@@ -897,6 +1030,7 @@ bool lift_full_command(
 
         if (bottom == LiftBottomLimit::Pressed ||
             bottom == LiftBottomLimit::Fault) {
+            trace_lift_path(0,bottom==LiftBottomLimit::Pressed?"BOTTOM_PRESSED":"BOTTOM_READ_FAULT",direction*LIFT_COMMISSIONING_MV,current_deg);
             lift_auton_stop();
             return false;
         }
@@ -908,6 +1042,7 @@ bool lift_full_command(
         if (!disable_axis(
                 lift, true,
                 lift.mode == AxisMode::Fault)) {
+            trace_lift_path(0,"OWNER_HANDOFF_STOP_FAILED",direction*LIFT_COMMISSIONING_MV,current_deg);
             return false;
         }
     }
@@ -920,6 +1055,7 @@ bool lift_full_command(
             true,
             direction * LIFT_COMMISSIONING_MV)) {
 
+        trace_lift_path(0,"WRITE_VOLTAGE_FAILED",direction*LIFT_COMMISSIONING_MV,current_deg);
         disable_axis(lift, true, true);
         return false;
     }
@@ -931,6 +1067,7 @@ bool lift_full_command(
 // STOP is the default; powered hold needs explicit validation and continued updates.
 bool auton_move_axis(AxisState& axis, bool is_lift, double target, unsigned timeout_ms,
                      LiftFinish finish = LiftFinish::STOP) {
+  if (is_lift && reject_lift_lockout()) return false;
   axis.auton_reason="START";
   if(!disable_axis(axis,is_lift,axis.mode==AxisMode::Fault)) {
     axis.auton_reason="STOP_WRITE_FAILED"; return false;
@@ -1018,20 +1155,60 @@ bool lift_auton_to_preset(
 bool arm_auton_move_to_deg(double target_deg, unsigned timeout_ms) {
   return auton_move_axis(arm, false, target_deg, timeout_ms);
 }
+// Read-only terminal telemetry. Uses the existing motor objects directly,
+// without depending on a cross-file LiftMotorTelemetry type declaration.
+namespace {
+void print_lift_motor_reading(const char* label, pros::Motor& motor) {
+  std::uint32_t timestamp = 0;
+  const auto raw = motor.get_raw_position(&timestamp);
+  std::printf("LIFT_READ %s conn=%d rpm=%+.1f mA=%ld raw=%ld tempC=%.1f\n",
+              label,
+              static_cast<int>(motor.is_installed()),
+              static_cast<double>(motor.get_actual_velocity()),
+              static_cast<long>(motor.get_current_draw()),
+              static_cast<long>(raw),
+              static_cast<double>(motor.get_temperature()));
+}
+} // namespace
+
 void lift_print_debug() {
+  static unsigned emitted[3]{};
+  const char* stages[]={"FULL","WRITE","UPDATE"};
+  for(unsigned n=0;n<3;++n){const auto& t=lift_path_trace[n];if(t.serial!=emitted[n]){
+    emitted[n]=t.serial;
+    std::printf("LIFT_PATH stage=%s reason=%s request_mv=%+d corrected_deg=%.3f event_ms=%u\n",stages[n],t.reason,t.requested,t.position,t.at);
+  }}
+  auto print_write=[](const char* label,const LiftWriteTrace& t){
+    std::printf("%s event_ms=%u P13=%+d P14=%+d P15=%+d result13=%ld result14=%ld result15=%ld errno13=%d errno14=%d errno15=%d fallback=%d [API commands, not measured voltage]\n",
+      label,t.at,(THIRD_LIFT_REVERSED?-1:1)*t.mv,(LEFT_LIFT_REVERSED?-1:1)*t.mv,(RIGHT_LIFT_REVERSED?-1:1)*t.mv,
+      t.result[0],t.result[1],t.result[2],t.error[0],t.error[1],t.error[2],t.fallback);
+  };
+  if(lift_write_trace.serial)print_write("LIFT_OUTPUT",lift_write_trace);
+  static unsigned powered_emitted=0;
+  if(lift_powered_write.serial!=powered_emitted){powered_emitted=lift_powered_write.serial;print_write("LIFT_POWERED_OUTPUT",lift_powered_write);}
+  static unsigned failed_emitted=0;
+  if(lift_failed_write.serial!=failed_emitted){failed_emitted=lift_failed_write.serial;print_write("LIFT_FAILED_OUTPUT",lift_failed_write);}
   const double position = lift_position_deg();
+  std::printf("P16_POSITION_V6 raw_centideg=%ld corrected_deg=%.3f software_sign=%+.0f native_config_verified=%d read_errno=%d valid=%d\n",
+              static_cast<long>(p16_last_raw), position, mechanism_config::LIFT_P16_SOFTWARE_SIGN,
+              p16_native_ready, p16_last_read_errno, std::isfinite(position));
   const bool target_active = lift.mode == AxisMode::MoveToTarget || lift.mode == AxisMode::Hold;
   const char* owner = lift_output_owner == LiftOutputOwner::Autonomous ? "AutonFull" :
       lift_output_owner == LiftOutputOwner::Driver ? "DriverFull" :
       returning_home ? "ReturningHome" : mode_name(lift.mode);
   std::printf("LIFT P16=%.3f deg valid=%d mode=%s target=%.3f target_active=%d "
-              "homed=%d feedback_fault=%d output_fault=%d\n",
+              "homed=%d sensor_fault=%d controller_fault=%d output_fault=%d lockout=%d reason=%s\n",
               position, std::isfinite(position), owner,
               target_active ? lift.target : NAN, target_active, lift.homed,
-              lift.mode == AxisMode::Fault, lift_output_fault);
+              !std::isfinite(position), lift.mode == AxisMode::Fault, lift_output_fault,
+               LIFT_MOTOR_SAFETY_LOCKOUT || ENABLE_LIFT_DIRECTION_DIAGNOSTIC, lift.auton_reason);
+  print_lift_motor_reading("P13 TOP", third_lift_motor());
+  print_lift_motor_reading("P14 LEFT", left_lift_motor());
+  print_lift_motor_reading("P15 RIGHT", right_lift_motor());
 }
 
 bool lift_return_home_start() {
+  if (reject_lift_lockout()) return false;
   using namespace mechanism_config;
   if (lift_output_owner != LiftOutputOwner::None) return false;
   if (returning_home) return true; // Repeated requests never restart the timer.
@@ -1054,18 +1231,20 @@ bool lift_return_home_start() {
 // ----- Lift mode service -----
 // Service whichever mode owns the lift: full output, target/hold, or switch-based return.
 void lift_update() {
-  if (pros::competition::is_disabled()) { disable_axis(lift, true, lift.mode == AxisMode::Fault); return; }
+  if (pros::competition::is_disabled()) { trace_lift_path(2,"DISABLED",0); disable_axis(lift, true, lift.mode == AxisMode::Fault); return; }
 
   if (lift_output_owner != LiftOutputOwner::None) {
     const bool expected_auton =
         lift_output_owner == LiftOutputOwner::Autonomous;
 
     if (pros::competition::is_autonomous() != expected_auton) {
+      trace_lift_path(2,"MODE_CHANGED",lift_full_direction*LIFT_COMMISSIONING_MV);
       lift_auton_stop();
       return;
     }
 
     if (lift.mode == AxisMode::Fault || lift_output_fault) {
+      trace_lift_path(2,lift_output_fault?"OUTPUT_FAULT":"AXIS_FAULT",lift_full_direction*LIFT_COMMISSIONING_MV);
       disable_axis(lift, true, true);
       return;
     }
@@ -1077,6 +1256,7 @@ void lift_update() {
     if (lift_full_last_refresh == 0 ||
         pros::millis() - lift_full_last_refresh >
             mechanism_config::MANUAL_COMMAND_TIMEOUT_MS) {
+      trace_lift_path(2,"MANUAL_REFRESH_TIMEOUT",lift_full_direction*LIFT_COMMISSIONING_MV);
 
       lift_auton_stop();
       return;
@@ -1084,6 +1264,7 @@ void lift_update() {
 
 
     if (!lift.homed) {
+      trace_lift_path(2,"NOT_HOMED",lift_full_direction*LIFT_COMMISSIONING_MV);
       lift_auton_stop();
       return;
     }
@@ -1091,6 +1272,7 @@ void lift_update() {
     const double position = read_position(true);
 
     if (!std::isfinite(position)) {
+      trace_lift_path(2,"INVALID_P16",lift_full_direction*LIFT_COMMISSIONING_MV,position);
       disable_axis(lift, true, true);
       return;
     }
@@ -1107,6 +1289,7 @@ void lift_update() {
           !pros::competition::is_connected();
       if ((max_known && position >= max_safe) ||
           (!max_known && !calibration_driver)) {
+        trace_lift_path(2,max_known?"UPPER_LIMIT":"UNKNOWN_UPPER_LIMIT",lift_full_direction*LIFT_COMMISSIONING_MV,position);
         lift_auton_stop();
         return;
       }
@@ -1117,6 +1300,7 @@ void lift_update() {
       const auto bottom = lift_bottom_limit_read();
 
       if (bottom == LiftBottomLimit::Fault) {
+        trace_lift_path(2,"BOTTOM_READ_FAULT",lift_full_direction*LIFT_COMMISSIONING_MV,position);
         disable_axis(lift, true, true);
         return;
       }
@@ -1124,6 +1308,7 @@ void lift_update() {
       
       if (bottom == LiftBottomLimit::Pressed ||
           position <= mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG) {
+          trace_lift_path(2,bottom==LiftBottomLimit::Pressed?"BOTTOM_PRESSED":"LOWER_LIMIT",lift_full_direction*LIFT_COMMISSIONING_MV,position);
 
           lift_auton_stop();
           return;
@@ -1136,6 +1321,7 @@ void lift_update() {
             lift_calibration::limits,
             position,
             lift_full_direction)) {
+      trace_lift_path(2,"CALIBRATION_DIRECTION_LIMIT",lift_full_direction*LIFT_COMMISSIONING_MV,position);
       lift_auton_stop();
       return;
     }
@@ -1691,6 +1877,10 @@ PreloadLiftResult preload_stop_result(PreloadLiftResult result, const char* reas
 }
 bool lift_preload_start(double target_deg, unsigned timeout_ms) {
   preload_result = PreloadLiftResult::Idle;
+  if (reject_lift_lockout()) {
+    preload_result = lift.mode == AxisMode::Fault ? PreloadLiftResult::Fault : PreloadLiftResult::Rejected;
+    return false;
+  }
   if (ez::autonomous_cancelled()) {
     preload_stop_result(PreloadLiftResult::Cancelled,"CANCELLED_OR_MODE"); return false;
   }
@@ -1831,4 +2021,37 @@ bool mechanisms_preflight(bool require_lift,bool require_toggle,bool require_fle
       claw_pneumatic_available(),ARM_ROTATION_PORT);
   return (!require_lift || (lift_sensor_ok && lift_motors && lift_target_ready())) &&
       (!require_toggle || toggle_ok) && (!require_flex || flex_ok);
+}
+
+void lift_direction_diagnostic_update() {
+  if (!mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC) return;
+  static bool sampled = false;
+  static unsigned last = 0;
+  static double previous[4] = {NAN,NAN,NAN,NAN};
+  const unsigned now = pros::millis();
+  // Cancel target/hold ownership as well as requesting zero on all three motors.
+  errno = 0;
+  const bool stopped = lift_auton_stop();
+  const int stop_error = errno;
+  if (sampled && now - last < 250) return;
+  sampled = true; last = now;
+  std::printf("LIFT_PASSIVE t_ms=%u zero_ok=%d stop_errno=%d [NO POWERED COMMANDS]\n",now,stopped,stop_error);
+  pros::Motor* motors[] = {&third_lift_motor(), &left_lift_motor(), &right_lift_motor()};
+  const int ports[] = {mechanism_config::THIRD_LIFT_PORT,mechanism_config::LEFT_LIFT_PORT,mechanism_config::RIGHT_LIFT_PORT};
+  for (unsigned i=0;i<3;++i) {
+    errno = 0; const bool connected = motors[i]->is_installed(); const int connection_error = errno;
+    std::uint32_t timestamp = 0;
+    errno = 0; const auto raw = motors[i]->get_raw_position(&timestamp); const int read_error = errno;
+    const bool valid = raw != PROS_ERR && read_error == 0;
+    const double value = valid ? static_cast<double>(raw) : NAN;
+    const double delta = value - previous[i]; previous[i] = value;
+    std::printf("LIFT_PASSIVE P%d connected=%d conn_errno=%d raw_counts=%ld delta_counts=%.0f valid=%d read_errno=%d sample_ms=%lu\n",
+      ports[i],connected,connection_error,static_cast<long>(raw),delta,valid,read_error,static_cast<unsigned long>(timestamp));
+  }
+  errno = 0; const auto raw16 = lift_sensor().get_position(); const int error16 = errno;
+  const bool valid16 = raw16 != PROS_ERR && error16 == 0;
+  const double deg16 = valid16 ? raw16 / 100.0 : NAN;
+  const double delta16 = deg16 - previous[3]; previous[3] = deg16;
+  std::printf("LIFT_PASSIVE P16 configured_reversal=%d raw_centideg=%ld deg=%.2f delta_deg=%.2f valid=%d read_errno=%d\n",
+    mechanism_config::LIFT_ROTATION_REVERSED,static_cast<long>(raw16),deg16,delta16,valid16,error16);
 }

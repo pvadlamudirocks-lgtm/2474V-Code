@@ -1,4 +1,3 @@
-
 #pragma once
 #include "api.h"
 #include "lift_calibration.hpp"
@@ -6,6 +5,10 @@
 
 // All wiring and calibration choices live here. Validation is documented per item.
 namespace mechanism_config {
+// TEMPORARY passive lift diagnostic. Set false and rebuild to restore normal operation.
+constexpr bool ENABLE_LIFT_DIRECTION_DIAGNOSTIC = false;
+// Recovery V4: normal hold-to-run software lockout disabled; motor directions NOT validated.
+constexpr bool LIFT_MOTOR_SAFETY_LOCKOUT = false;
 // ----- Wiring and physical directions -----
 // Change assignments here after checking the robot, rather than in route functions.
 // Legacy distance_correction.cpp is excluded; its P11/P12 placeholders are obsolete.
@@ -111,7 +114,10 @@ constexpr bool LEFT_LIFT_REVERSED = false;
 constexpr bool RIGHT_LIFT_REVERSED = true;
 constexpr bool THIRD_LIFT_REVERSED = true;
 constexpr bool ARM_MOTOR_REVERSED = false;
-constexpr bool LIFT_ROTATION_REVERSED = true;
+// V6: P16 native hardware reversal is always disabled. The software sign below
+// translates measured raw sensor degrees to positive-up lift degrees.
+constexpr bool LIFT_ROTATION_REVERSED = false;
+constexpr double LIFT_P16_SOFTWARE_SIGN = +1.0; // Verified UP: native-off raw +7005, +15205 centidegrees.
 constexpr bool ARM_ROTATION_REVERSED = false;
 // Confirmed: sensor is on the actual lift/output axle. Only centidegrees ->
 // degrees conversion applies; no extra motor-to-output scaling at 1:1.
@@ -282,6 +288,21 @@ bool lift_move_calibrated_position(unsigned preset, unsigned timeout_ms, LiftFin
 bool toggle_connected();
 bool mechanisms_preflight(bool require_lift, bool require_toggle, bool require_flex);
 bool arm_auton_move_to_deg(double target_deg, unsigned timeout_ms);
+// Read-only lift telemetry: never commands or energizes a motor.
+struct LiftMotorTelemetry {
+  bool connected;
+  long raw_counts;
+  double actual_rpm;
+  long current_ma;
+  double temperature_c;
+};
+struct LiftTelemetry {
+  LiftMotorTelemetry top_p13;
+  LiftMotorTelemetry left_p14;
+  LiftMotorTelemetry right_p15;
+  double p16_deg;
+};
+LiftTelemetry lift_read_telemetry();
 void lift_print_debug(); // P16 validity, owner/mode, target, reference and faults.
 void arm_update();
 void mechanisms_update(); // Call every 10 ms, including during autonomous motion.
@@ -309,9 +330,9 @@ void mechanisms_print_debug(); // Throttled terminal output; preserves odom scre
 // Call manual tests every loop with held inputs, then mechanisms_update().
 // Both held commands zero manual voltage; release captures hold once.
 void test_lift_manual(bool up_held, bool down_held);
-// TEMPORARY: hold L1=14 +12000/15 -12000 electrical mV; hold L2=opposite.
+// Driver L1/L2 calls test_lift_motor_response; all three motors share the voltage writer.
 // Compensates existing object reversals without changing motor configuration.
-// Repeatable, no time limit while held. Release or both held zeros BOTH motors.
+// Repeated driver commands have a short refresh watchdog; release zeros all three motors.
 bool test_lift_motor_response(bool up_held, bool down_held);
 void test_arm_manual(bool up_held, bool down_held);
 void test_lift_rotation_sensor(); // Read/print only.
@@ -358,3 +379,5 @@ void auton_auto_clamp_update();
 bool auton_auto_clamp_triggered();
 auto_clamp::State auton_auto_clamp_state();
 const char* auton_auto_clamp_reason(); // Static diagnostic string; no terminal IO in update.
+// Passive sample; commands zero only. Call from the diagnostic driver loop.
+void lift_direction_diagnostic_update();

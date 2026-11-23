@@ -1,4 +1,3 @@
-
 #include "main.h"
 #include "telemetry.hpp"
 #include "anti_tip.hpp"
@@ -6,9 +5,11 @@
 #include "liblvgl/llemu.hpp" // Explicit LCD callback declarations for editor and build.
 
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <cmath>
 #include <atomic>
+#include <cstdint>
 
 #include "autons.hpp"
 #include "dev_tests.hpp"
@@ -24,6 +25,18 @@
 
 #include "pose_recorder.hpp"
 #include "route_config.hpp"
+
+// 2474V lift recovery build marker: fail the build if an old locked header is used.
+// This is a source/build check; it does NOT verify physical motor direction.
+static_assert(!mechanism_config::LIFT_ROTATION_REVERSED &&
+              mechanism_config::LIFT_P16_SOFTWARE_SIGN == +1.0,
+              "V6 requires P16 software sign +1 and native reversal false");
+static_assert(!mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT,
+              "LIFT_FIX_V6: wrong/old subsystems.hpp has LIFT_MOTOR_SAFETY_LOCKOUT=true");
+static_assert(!mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,
+              "LIFT_FIX_V6: passive direction diagnostic still enabled");
+static_assert(mechanism_config::LIFT_LIMITS_CALIBRATED,
+              "LIFT_FIX_V6: lift limits not configured in lift_calibration.hpp");
 
 namespace {
 // ----- Tracking geometry and driver settings -----
@@ -47,6 +60,11 @@ constexpr int DRIVER_DEADZONE = 5;
 constexpr int DRIVER_LOOP_MS = 10;
 constexpr int ODOM_DISPLAY_REFRESH_MS = 100;
 std::atomic<const char*> development_mode{"DRIVER"};
+// Display-only lift troubleshooting: leave mechanism commands and lockout unchanged.
+constexpr bool SHOW_LIFT_TELEMETRY_SCREEN = true;
+std::atomic<int> lift_button_mask{0}; // 1=L1, 2=L2
+std::atomic<bool> lift_detail_page{false}; // Controller D-pad RIGHT toggles page.
+
 
 bool imu_calibrated = false;
 bool driver_coast_mode = false;
@@ -132,6 +150,93 @@ void display_odom_pose() {
     pros::screen::set_pen(0x0000FF00);
     pros::screen::fill_rect(0, 0, 479, 239);
     odom_display_redraw = false;
+  }
+  if (SHOW_LIFT_TELEMETRY_SCREEN && !pros::competition::is_autonomous()) {
+    // Read motor telemetry directly so the Brain screen does not depend on
+    // a new telemetry struct declaration being visible through subsystems.hpp.
+    struct ScreenMotorTelemetry {
+      bool connected;
+      long raw_counts;
+      double actual_rpm;
+      long current_ma;
+      double temperature_c;
+    };
+    struct ScreenLiftTelemetry {
+      ScreenMotorTelemetry top_p13;
+      ScreenMotorTelemetry left_p14;
+      ScreenMotorTelemetry right_p15;
+      double p16_deg;
+    };
+    static pros::Motor screen_p13(mechanism_config::THIRD_LIFT_PORT,
+                                  pros::v5::MotorGears::green);
+    static pros::Motor screen_p14(mechanism_config::LEFT_LIFT_PORT,
+                                  pros::v5::MotorGears::green);
+    static pros::Motor screen_p15(mechanism_config::RIGHT_LIFT_PORT,
+                                  pros::v5::MotorGears::green);
+    const auto read_motor = [](pros::Motor& motor) -> ScreenMotorTelemetry {
+      std::uint32_t timestamp = 0;
+      const auto raw = motor.get_raw_position(&timestamp);
+      return ScreenMotorTelemetry{
+          motor.is_installed(),
+          static_cast<long>(raw),
+          motor.get_actual_velocity(),
+          static_cast<long>(motor.get_current_draw()),
+          motor.get_temperature()};
+    };
+    const ScreenLiftTelemetry t{
+        read_motor(screen_p13),
+        read_motor(screen_p14),
+        read_motor(screen_p15),
+        lift_position_deg()};
+    const int buttons = lift_button_mask.load();
+    const bool detail = lift_detail_page.load();
+    const bool locked = mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT ||
+                        mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC;
+    pros::screen::set_eraser(0x0000FF00);
+    pros::screen::set_pen(0x00000000);
+    if (!detail) {
+      pros::screen::print(pros::E_TEXT_MEDIUM, 1,
+          "LIFT FIX V6   LOCKOUT:%d       ", locked);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 2,
+          "L1:%d L2:%d  REQ:%-4s P16:%6.1f   ",
+          !!(buttons & 1), !!(buttons & 2),
+          buttons == 1 ? "UP" : buttons == 2 ? "DOWN" : "STOP", t.p16_deg);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 3,
+          "P13 TOP   rpm:%+6.1f mA:%5ld   ",
+          t.top_p13.actual_rpm, t.top_p13.current_ma);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 4,
+          "P14 LEFT  rpm:%+6.1f mA:%5ld   ",
+          t.left_p14.actual_rpm, t.left_p14.current_ma);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 5,
+          "P15 RIGHT rpm:%+6.1f mA:%5ld   ",
+          t.right_p15.actual_rpm, t.right_p15.current_ma);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 6,
+          "CONNECTED P13:%d P14:%d P15:%d ",
+          t.top_p13.connected, t.left_p14.connected, t.right_p15.connected);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 7,
+          "D-PAD RIGHT=DETAIL  %s       ", locked ? "NO POWER" : "CHECK LIFT");
+    } else {
+      pros::screen::print(pros::E_TEXT_MEDIUM, 1,
+          "LIFT DETAIL V6 LOCKOUT:%d     ", locked);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 2,
+          "P13 RAW:%+8ld TEMP:%5.1fC  ",
+          t.top_p13.raw_counts, t.top_p13.temperature_c);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 3,
+          "P14 RAW:%+8ld TEMP:%5.1fC  ",
+          t.left_p14.raw_counts, t.left_p14.temperature_c);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 4,
+          "P15 RAW:%+8ld TEMP:%5.1fC  ",
+          t.right_p15.raw_counts, t.right_p15.temperature_c);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 5,
+          "CONNECTED 13:%d 14:%d 15:%d  ",
+          t.top_p13.connected, t.left_p14.connected, t.right_p15.connected);
+      pros::screen::print(pros::E_TEXT_MEDIUM, 6,
+          "P16:%8.2f   L1:%d L2:%d   ",
+          t.p16_deg, !!(buttons & 1), !!(buttons & 2));
+      pros::screen::print(pros::E_TEXT_MEDIUM, 7,
+          "D-PAD RIGHT=LIVE  %s         ", locked ? "NO POWER" : "CHECK LIFT");
+    }
+    return;
   }
   pros::screen::set_eraser(0x0000FF00);
   pros::screen::set_pen(0x00000000);
@@ -226,6 +331,12 @@ void initialize() {
       pros::E_TEXT_MEDIUM, 1, "2474V RECOVERY START");
 
   std::printf("RECOVERY: initialize entered\n");
+  std::printf("LIFT_BUILD_ID=2474V_P16_FIX_V6 lockout=%d diagnostic=%d limits=%d motor_mV=%d p16_soft_sign=%+.0f\n",
+              mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT,
+              mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,
+              mechanism_config::LIFT_LIMITS_CALIBRATED,
+              mechanism_config::LIFT_MANUAL_MV,
+              mechanism_config::LIFT_P16_SOFTWARE_SIGN);
   std::fflush(stdout);
 
   // 1. Prepare drivetrain control.
@@ -233,7 +344,8 @@ void initialize() {
 
   // 2. Initialize existing mechanisms.
   mechanisms_initialize();
-  if (mechanism_config::ENABLE_LIFT_STARTUP_ZERO) {
+  if (mechanism_config::ENABLE_LIFT_STARTUP_ZERO &&
+      !mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC) {
 
   // If a physical bottom switch is installed,
   // require it to confirm home.
@@ -380,6 +492,12 @@ std::fflush(stdout);
 }
 
 void autonomous() {
+  if (mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC) {
+    ez::drive_stop(&chassis);
+    lift_auton_stop();
+    std::printf("LIFT_PASSIVE: autonomous suppressed; use driver mode for readings\n");
+    return;
+  }
     // Temporary diagnostic disabled.
     constexpr bool RUN_STATIONARY_TEST = false;
 
@@ -442,6 +560,15 @@ void opcontrol() {
   // This loop owns driver motor commands and services the mechanism state machines.
 
   auton::lifecycle_stop("opcontrol");
+  if (mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC) {
+    std::printf("LIFT_PASSIVE: support lift; driver controls inactive; exit by disabling flag and rebuilding\n");
+    while (!pros::competition::is_disabled() && !pros::competition::is_autonomous()) {
+      lift_direction_diagnostic_update();
+      pros::delay(20);
+    }
+    lift_auton_stop();
+    return;
+  }
   ez::driver_control_ready(); // Authorize driver output only after existing cleanup returns.
   development_mode = pose_recorder::enabled ? "POSE RECORDER" : "DRIVER";
   show_live_odometry();
@@ -476,13 +603,42 @@ while (true) {
     // Release or both held stops both motors; no presets or automatic return.
     // L1 requests up; L2 requests down. Motor configuration is unchanged.
     // Manual lift controls.
-const bool lift_up =
-    master.get_digital(pros::E_CONTROLLER_DIGITAL_L1);
+errno=0;
+const auto lift_up_raw=master.get_digital(pros::E_CONTROLLER_DIGITAL_L1);
+const int lift_up_error=errno;
+errno=0;
+const auto lift_down_raw=master.get_digital(pros::E_CONTROLLER_DIGITAL_L2);
+const int lift_down_error=errno;
+// Preserve existing bool conversion; expose read errors without changing controls.
+const bool lift_up=lift_up_raw;
+const bool lift_down=lift_down_raw;
 
-const bool lift_down =
-    master.get_digital(pros::E_CONTROLLER_DIGITAL_L2);
+lift_button_mask.store((lift_up ? 1 : 0) | (lift_down ? 2 : 0));
+if (SHOW_LIFT_TELEMETRY_SCREEN &&
+    master.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_RIGHT)) {
+    lift_detail_page.store(!lift_detail_page.load());
+}
 
-test_lift_motor_response(lift_up, lift_down);
+// Live L1/L2 hold-to-run output. The return value says whether the
+// controller accepted the request; it does not prove actual shaft direction.
+const bool lift_request_accepted = test_lift_motor_response(lift_up, lift_down);
+
+if (SHOW_LIFT_TELEMETRY_SCREEN) {
+    static unsigned last_button_log = 0;
+    static int last_button_mask = -1;
+    const unsigned now = pros::millis();
+    const int current_button_mask=(lift_up?1:0)|(lift_down?2:0);
+    if (current_button_mask!=last_button_mask || now - last_button_log >= 500) {
+        last_button_mask=current_button_mask;
+        last_button_log = now;
+        std::printf("LIFT_FIX_V6 L1=%d L2=%d accepted=%d lockout=%d limits=%d P16=%.2f rawL1=%ld rawL2=%ld errnoL1=%d errnoL2=%d\n",
+                    lift_up, lift_down, lift_request_accepted,
+                    mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT ||
+                    mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,
+                    mechanism_config::LIFT_LIMITS_CALIBRATED,
+                    lift_position_deg(),static_cast<long>(lift_up_raw),static_cast<long>(lift_down_raw),lift_up_error,lift_down_error);
+    }
+}
 
 
 // Y alone moves the lift to its calibrated Intake position.
@@ -525,3 +681,19 @@ telemetry_update(master);
 pros::delay(DRIVER_LOOP_MS);
 }   
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
