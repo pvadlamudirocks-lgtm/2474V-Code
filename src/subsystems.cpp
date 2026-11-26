@@ -1,4 +1,5 @@
 #include "subsystems.hpp"
+#include "claw_distance.hpp"
 #include "lift_calibration.hpp"
 #include "EZ-Template/navigation_hooks.hpp"
 #include <cmath>
@@ -7,11 +8,12 @@
 #include <limits>
 #include <cerrno>
 #include <cstdint>
+#include <atomic>
 
 namespace {
 using namespace mechanism_config;
-// Temporary low-voltage commissioning cap for all open-loop lift commands.
-// Restore higher power ONLY after the three-motor lift is physically qualified.
+// Existing voltage capability retained for autonomous/other commands.
+// Manual driver UP and DOWN use RPM control with green cartridges.
 
 constexpr int LIFT_COMMISSIONING_MV = 12000;
 static_assert(THIRD_LIFT_PORT >= 1 && THIRD_LIFT_PORT <= 21 &&
@@ -56,11 +58,11 @@ pros::Rotation& arm_sensor() {
   static pros::Rotation sensor(ARM_ROTATION_REVERSED ? -ARM_ROTATION_PORT : ARM_ROTATION_PORT);
   return sensor;
 }
-pros::Distance& claw_distance() {
-  static pros::Distance sensor(CLAW_DISTANCE_PORT);
-  return sensor;
-}
+
+void log_claw_constructor(bool output);
 pros::adi::DigitalOut& claw_piston(bool initial_output) {
+  static const bool announced = (log_claw_constructor(initial_output), true);
+  (void)announced;
   static pros::adi::DigitalOut piston(CLAW_PNEUMATIC_PORT, initial_output);
   return piston;
 }
@@ -167,9 +169,40 @@ bool claw_raw_state = false; // Electrical output only; open/closed is unverifie
 bool flip_is_reverse = false; // Known normal software state; no startup toggle.
 bool claw_state_written = false;
 bool flip_state_written = false;
-bool object_detected = false;
-unsigned object_readings = 0;
-unsigned last_distance_sample = 0;
+
+// Instrumentation only: no new output object, state mutation or command retry.
+std::atomic<unsigned> claw_write_sequence{0};
+std::atomic<bool> claw_observation_enabled{false};
+std::atomic<unsigned> claw_observation_started{0};
+void log_claw_constructor(bool output) {
+  const int saved=errno;
+  std::printf("CLAW_CONSTRUCT ms=%u caller=FIRST_ACCESS adi=%c requested_output=%d api_result=UNAVAILABLE constructor_initializes_output=1 autonomous=%d disabled=%d\n",
+      pros::millis(),CLAW_PNEUMATIC_PORT,output,pros::competition::is_autonomous(),pros::competition::is_disabled());
+  errno=saved;
+}
+void log_claw_rejection(const char* caller,bool open,const char* reason) {
+  const int saved=errno;
+  std::printf("CLAW_REJECT ms=%u task=%p caller=%s reason=%s requested_open=%d requested_output=%d previous_open=%d previous_raw=%d previous_written=%d autonomous=%d disabled=%d errno=%d\n",
+      pros::millis(),pros::c::task_get_current(),caller,reason,open,
+      open?CLAW_OPEN_OUTPUT:!CLAW_OPEN_OUTPUT,claw_is_open,claw_raw_state,claw_state_written,
+      pros::competition::is_autonomous(),pros::competition::is_disabled(),saved);
+  errno=saved;
+}
+std::int32_t write_claw_logged(bool output,const char* caller,bool open) {
+  auto& piston=claw_piston(output);
+  const unsigned seq=claw_write_sequence.fetch_add(1)+1;
+  const unsigned at=pros::millis();
+  const bool old_open=claw_is_open,old_raw=claw_raw_state,old_written=claw_state_written;
+  const bool autonomous=pros::competition::is_autonomous(),disabled=pros::competition::is_disabled();
+  errno=0;
+  const auto result=piston.set_value(output); // The original write; exactly once.
+  const int error=errno;
+  std::printf("CLAW_WRITE seq=%u ms=%u task=%p caller=%s adi=%c requested_open=%d requested_output=%d previous_open=%d previous_raw=%d previous_written=%d api_result=%ld errno=%d autonomous=%d disabled=%d\n",
+      seq,at,pros::c::task_get_current(),caller,CLAW_PNEUMATIC_PORT,open,output,
+      old_open,old_raw,old_written,static_cast<long>(result),error,autonomous,disabled);
+  errno=error;
+  return result;
+}
 
 // P16 has one software sign; native reversal must be confirmed off before use.
 bool p16_native_ready = false;
@@ -206,10 +239,10 @@ LiftPathTrace lift_path_trace[3]; // FULL request, WRITE guard, periodic UPDATE
 void trace_lift_path(unsigned slot,const char* reason,int requested,double position=NAN) {
   auto& t=lift_path_trace[slot];t.reason=reason;t.requested=requested;t.position=position;t.at=pros::millis();++t.serial;
 }
-struct LiftWriteTrace { int mv=0; long result[3]{}; int error[3]{}; bool fallback=false; unsigned at=0,serial=0; };
+struct LiftWriteTrace { int mv=0; long result[3]{}; int error[3]{}; bool fallback=false; bool velocity=false; unsigned at=0,serial=0; };
 LiftWriteTrace lift_write_trace, lift_failed_write, lift_powered_write;
-void trace_lift_write(int mv,long p13,long p14,long p15,int e13,int e14,int e15,bool fallback=false) {
-  lift_write_trace.mv=mv;lift_write_trace.result[0]=p13;lift_write_trace.result[1]=p14;lift_write_trace.result[2]=p15;
+void trace_lift_write(int mv,long p13,long p14,long p15,int e13,int e14,int e15,bool fallback=false, bool velocity=false) {
+  lift_write_trace.velocity=velocity;lift_write_trace.mv=mv;lift_write_trace.result[0]=p13;lift_write_trace.result[1]=p14;lift_write_trace.result[2]=p15;
   lift_write_trace.error[0]=e13;lift_write_trace.error[1]=e14;lift_write_trace.error[2]=e15;
   lift_write_trace.fallback=fallback;lift_write_trace.at=pros::millis();++lift_write_trace.serial;
   if(mv!=0)lift_powered_write=lift_write_trace;
@@ -217,7 +250,9 @@ void trace_lift_write(int mv,long p13,long p14,long p15,int e13,int e14,int e15,
 }
 // Shared lift output: positive command = UP. P13 uses P15's motor
 // polarity and P15's -up_mv command; confirm actual shaft direction first.
-bool write_lift_pair(int up_mv) {
+bool write_lift_pair(int up_mv, bool velocity_mode = false) {
+  // Zero always uses voltage mode to cancel an active motor velocity controller.
+  velocity_mode = velocity_mode && up_mv != 0;
   if ((LIFT_MOTOR_SAFETY_LOCKOUT || ENABLE_LIFT_DIRECTION_DIAGNOSTIC) && up_mv != 0) {
     trace_lift_path(1,"LOCKOUT",up_mv);
     write_lift_pair(0); // Same writer; never allow a preset/manual path to energize the lift.
@@ -259,34 +294,37 @@ if (up_mv != 0) {
 
   // Diagnostic evidence for the exact program that reaches the motor API.
   // Print only on command changes, never every 10-ms driver update.
+  const int command = velocity_mode && up_mv != 0
+      ? (up_mv > 0 ? LIFT_UP_TARGET_RPM : -LIFT_DOWN_TARGET_RPM)
+      : up_mv;
+  velocity_mode = velocity_mode && up_mv != 0;
+  static bool last_logged_velocity = false;
   static int last_logged_voltage = -13001;
-  if (up_mv != last_logged_voltage) {
-    last_logged_voltage = up_mv;
-    std::printf("LIFT_MOTOR_WRITE_V6 up_mv=%+d P13=%+d P14=%+d P15=%+d\n",
-                up_mv,
-                (THIRD_LIFT_REVERSED ? -1 : 1) * up_mv,
-                (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv,
-                (RIGHT_LIFT_REVERSED ? -1 : 1) * up_mv);
+  if (command != last_logged_voltage || velocity_mode != last_logged_velocity) {
+    last_logged_voltage = command;
+    last_logged_velocity = velocity_mode;
+    std::printf("LIFT_MOTOR_WRITE_V8 mode=%s units=%s logical_command=%+d P13=%+d P14=%+d P15=%+d\n",
+                velocity_mode ? "VELOCITY" : "VOLTAGE", velocity_mode ? "rpm" : "mV", command,
+                (THIRD_LIFT_REVERSED ? -1 : 1) * command,
+                (LEFT_LIFT_REVERSED ? -1 : 1) * command,
+                (RIGHT_LIFT_REVERSED ? -1 : 1) * command);
     std::fflush(stdout);
   }
 
   errno=0;
-  const auto left = left_lift_motor().move_voltage(
-      (LEFT_LIFT_REVERSED ? -1 : 1) * up_mv);
+  const auto left = (velocity_mode ? left_lift_motor().move_velocity((LEFT_LIFT_REVERSED ? -1 : 1) * command) : left_lift_motor().move_voltage((LEFT_LIFT_REVERSED ? -1 : 1) * command));
   const int error14=errno;
 
   errno=0;
-  const auto right = right_lift_motor().move_voltage(
-      (RIGHT_LIFT_REVERSED ? -1 : 1) * up_mv);
+  const auto right = (velocity_mode ? right_lift_motor().move_velocity((RIGHT_LIFT_REVERSED ? -1 : 1) * command) : right_lift_motor().move_voltage((RIGHT_LIFT_REVERSED ? -1 : 1) * command));
   const int error15=errno;
 
       
 
 errno=0;
-const auto third = third_lift_motor().move_voltage(
-    (mechanism_config::THIRD_LIFT_REVERSED ? -1 : 1) * up_mv);
+const auto third = (velocity_mode ? third_lift_motor().move_velocity((THIRD_LIFT_REVERSED ? -1 : 1) * command) : third_lift_motor().move_voltage((THIRD_LIFT_REVERSED ? -1 : 1) * command));
 const int error13=errno;
-trace_lift_write(up_mv,third,left,right,error13,error14,error15);
+trace_lift_write(command,third,left,right,error13,error14,error15,false,velocity_mode);
 
 // All three motor commands must succeed.
 if (left != PROS_ERR &&
@@ -310,7 +348,7 @@ return false;
 
 
 
-bool write_voltage(bool is_lift, int mv) {
+bool write_voltage(bool is_lift, int mv, bool velocity_mode = false) {
   if (!is_lift) {
     return arm_motor().move_voltage(mv) != PROS_ERR;
   }
@@ -378,7 +416,7 @@ if (mv > 0) {
 
   }
 
-  return write_lift_pair(mv);
+  return write_lift_pair(mv, velocity_mode);
 }
 
 
@@ -450,7 +488,7 @@ void initialize_axis(AxisState& axis, bool is_lift) {
       const int get_error = errno;
       native_config_ok = result == 1 && set_error == 0 && actual == 0 && get_error == 0;
       p16_native_ready = native_config_ok;
-      std::printf("P16_CONFIG_V6 native_reverse_requested=0 native_reverse_actual=%ld result=%ld set_errno=%d get_errno=%d software_sign=%+.0f verified=%d\n",
+      std::printf("P16_CONFIG_V7 native_reverse_requested=0 native_reverse_actual=%ld result=%ld set_errno=%d get_errno=%d software_sign=%+.0f verified=%d\n",
                   static_cast<long>(actual), static_cast<long>(result), set_error, get_error,
                   mechanism_config::LIFT_P16_SOFTWARE_SIGN, native_config_ok);
   }
@@ -794,41 +832,8 @@ const char* mode_name(AxisMode mode) {
 
 // ----- Optional claw-area detection -----
 // Require repeated valid readings before requesting an arm action.
-void update_object_detection() {
-  if (CLAW_DISTANCE_PORT < 1 || CLAW_DISTANCE_PORT > 21 ||
-      !ENABLE_CLAW_DISTANCE_AUTO_ARM || !CLAW_DISTANCE_CALIBRATED ||
-      CLAW_DETECT_MIN_MM <= 0 || CLAW_DETECT_MAX_MM <= CLAW_DETECT_MIN_MM ||
-      CLAW_DETECT_CONSISTENT_READINGS == 0) {
-    object_detected = false;
-    object_readings = 0;
-    return;
-  }
-  const unsigned now = pros::millis();
-  if (now - last_distance_sample < CLAW_DISTANCE_SAMPLE_MS) return;
-  // Widely separated readings are not a consistent detection sequence.
-  if (now - last_distance_sample > MAX_UPDATE_GAP_MS) {
-    object_readings = 0;
-    object_detected = false;
-  }
-  last_distance_sample = now;
-  const auto mm = claw_distance().get();
-  // Installed PROS documents confidence only above 200 mm. Near the claw,
-  // validate range and repeated samples instead of rejecting unavailable confidence.
-  bool valid = mm != PROS_ERR && mm != 9999 && mm > 0;
-  if (valid && mm > DISTANCE_CONFIDENCE_AVAILABLE_ABOVE_MM) {
-    const auto confidence = claw_distance().get_confidence();
-    valid = confidence != PROS_ERR && confidence >= CLAW_DETECT_MIN_CONFIDENCE;
-  }
-  const bool in_range = valid && mm >= CLAW_DETECT_MIN_MM && mm <= CLAW_DETECT_MAX_MM;
-  if (!in_range) object_readings = 0;
-  else if (object_readings < CLAW_DETECT_CONSISTENT_READINGS) ++object_readings;
-  const bool previous_detection = object_detected;
-  object_detected = object_readings >= CLAW_DETECT_CONSISTENT_READINGS;
-  // One request per detection edge; no queued surprise after manual release.
-  // Do not replace a manual command or an existing automatic target.
-  if (object_detected && !previous_detection && arm.mode == AxisMode::Hold)
-    arm_move_score();
-}
+void update_object_detection() { claw_distance::update(); }
+
 } // namespace
 
 void lift_initialize() {
@@ -849,16 +854,14 @@ void arm_initialize() {
 
 
 void mechanisms_initialize() {
+  claw_distance::cancel();
   flex_stop();
   toggle_stop();
   lift_initialize();
   arm_initialize();
-  object_detected = false;
-  object_readings = 0;
-  last_distance_sample = pros::millis();
   if (claw_pneumatic_available()) {
     claw_raw_state = false;
-    claw_state_written = claw_piston(false).set_value(false) != PROS_ERR;
+    claw_state_written = write_claw_logged(false,"STARTUP_INITIALIZE",false == CLAW_OPEN_OUTPUT) != PROS_ERR;
     claw_is_open = claw_raw_state == mechanism_config::CLAW_OPEN_OUTPUT;
   }
   if (mechanism_config::ENABLE_PNEUMATICS) {
@@ -952,7 +955,7 @@ LiftBottomLimit lift_bottom_limit_read() {
 }
 bool lift_return_home_active() { return returning_home; }
 namespace {
-// ----- Full-voltage lift control -----
+// ----- Driver velocity / autonomous voltage lift control -----
 // Use the shared UP/DOWN motor mapping and give this command exclusive lift ownership.
 
 bool lift_full_command(
@@ -990,7 +993,7 @@ bool lift_full_command(
         const unsigned now = pros::millis();
         if (now - last_reject_report >= 500) {
             last_reject_report = now;
-            std::printf("LIFT_REJECT_V6 enabled=%d limits=%d init=%d homed=%d fault=%d output_fault=%d home_busy=%d dir=%d\n",
+            std::printf("LIFT_REJECT_V7 enabled=%d limits=%d init=%d homed=%d fault=%d output_fault=%d home_busy=%d dir=%d\n",
                         enabled, LIFT_LIMITS_CALIBRATED, lift.initialized,
                         lift.homed, lift.mode == AxisMode::Fault,
                         lift_output_fault, returning_home, direction);
@@ -1017,7 +1020,7 @@ bool lift_full_command(
         const unsigned now = pros::millis();
         if (now - last_limit_report >= 500) {
             last_limit_report = now;
-            std::printf("LIFT_LIMIT_STOP_V6 direction=%+d P16=%.2f lower_margin=%.2f max=%.2f\n",
+            std::printf("LIFT_LIMIT_STOP_V7 direction=%+d P16=%.2f lower_margin=%.2f max=%.2f\n",
                         direction, current_deg,
                         mechanism_config::LIFT_LOWER_STOP_MARGIN_DEG, max_safe);
         }
@@ -1053,9 +1056,10 @@ bool lift_full_command(
 
     if (!write_voltage(
             true,
-            direction * LIFT_COMMISSIONING_MV)) {
+            direction * LIFT_COMMISSIONING_MV,
+            owner == LiftOutputOwner::Driver)) {
 
-        trace_lift_path(0,"WRITE_VOLTAGE_FAILED",direction*LIFT_COMMISSIONING_MV,current_deg);
+        trace_lift_path(0,"MOTOR_OUTPUT_FAILED",direction*LIFT_COMMISSIONING_MV,current_deg);
         disable_axis(lift, true, true);
         return false;
     }
@@ -1176,11 +1180,11 @@ void lift_print_debug() {
   const char* stages[]={"FULL","WRITE","UPDATE"};
   for(unsigned n=0;n<3;++n){const auto& t=lift_path_trace[n];if(t.serial!=emitted[n]){
     emitted[n]=t.serial;
-    std::printf("LIFT_PATH stage=%s reason=%s request_mv=%+d corrected_deg=%.3f event_ms=%u\n",stages[n],t.reason,t.requested,t.position,t.at);
+    std::printf("LIFT_PATH stage=%s reason=%s guard_request_mv=%+d corrected_deg=%.3f event_ms=%u\n",stages[n],t.reason,t.requested,t.position,t.at);
   }}
   auto print_write=[](const char* label,const LiftWriteTrace& t){
-    std::printf("%s event_ms=%u P13=%+d P14=%+d P15=%+d result13=%ld result14=%ld result15=%ld errno13=%d errno14=%d errno15=%d fallback=%d [API commands, not measured voltage]\n",
-      label,t.at,(THIRD_LIFT_REVERSED?-1:1)*t.mv,(LEFT_LIFT_REVERSED?-1:1)*t.mv,(RIGHT_LIFT_REVERSED?-1:1)*t.mv,
+    std::printf("%s mode=%s units=%s event_ms=%u P13=%+d P14=%+d P15=%+d result13=%ld result14=%ld result15=%ld errno13=%d errno14=%d errno15=%d fallback=%d [API targets, not measured output]\n",
+      label,t.velocity?"VELOCITY":"VOLTAGE",t.velocity?"rpm":"mV",t.at,(THIRD_LIFT_REVERSED?-1:1)*t.mv,(LEFT_LIFT_REVERSED?-1:1)*t.mv,(RIGHT_LIFT_REVERSED?-1:1)*t.mv,
       t.result[0],t.result[1],t.result[2],t.error[0],t.error[1],t.error[2],t.fallback);
   };
   if(lift_write_trace.serial)print_write("LIFT_OUTPUT",lift_write_trace);
@@ -1189,7 +1193,7 @@ void lift_print_debug() {
   static unsigned failed_emitted=0;
   if(lift_failed_write.serial!=failed_emitted){failed_emitted=lift_failed_write.serial;print_write("LIFT_FAILED_OUTPUT",lift_failed_write);}
   const double position = lift_position_deg();
-  std::printf("P16_POSITION_V6 raw_centideg=%ld corrected_deg=%.3f software_sign=%+.0f native_config_verified=%d read_errno=%d valid=%d\n",
+  std::printf("P16_POSITION_V7 raw_centideg=%ld corrected_deg=%.3f software_sign=%+.0f native_config_verified=%d read_errno=%d valid=%d\n",
               static_cast<long>(p16_last_raw), position, mechanism_config::LIFT_P16_SOFTWARE_SIGN,
               p16_native_ready, p16_last_read_errno, std::isfinite(position));
   const bool target_active = lift.mode == AxisMode::MoveToTarget || lift.mode == AxisMode::Hold;
@@ -1397,10 +1401,13 @@ ArmMode arm_mode() {
 }
 // ----- Pneumatic commands -----
 // Routes request open/closed states here instead of writing raw ADI outputs.
-bool claw_set(bool open) {
-  if (pros::competition::is_autonomous() && ez::autonomous_cancelled()) return false;
-  if (!open && returning_home) return false; // R1 cannot close during descent.
+static bool claw_set_logged(bool open,const char* caller) {
+  claw_distance::CommandGuard command;
+  if (!command) { log_claw_rejection(caller,open,"COMMAND_GUARD"); return false; }
+  if (pros::competition::is_autonomous() && ez::autonomous_cancelled()) { log_claw_rejection(caller,open,"AUTON_CANCELLED"); return false; }
+  if (!open && returning_home) { log_claw_rejection(caller,open,"RETURNING_HOME"); return false; } // R1 cannot close during descent.
   if (!claw_pneumatic_available() || pros::competition::is_disabled()) {
+    log_claw_rejection(caller,open,"UNAVAILABLE_OR_DISABLED");
     if (pros::competition::is_autonomous()) {
       ez::autonomous_emergency_stop();
       std::printf("CLAW rejected: unavailable or disabled\n");
@@ -1408,7 +1415,7 @@ bool claw_set(bool open) {
     return false;
   }
   const bool output = open ? mechanism_config::CLAW_OPEN_OUTPUT : !mechanism_config::CLAW_OPEN_OUTPUT;
-  if (claw_piston(output).set_value(output) == PROS_ERR) {
+  if (write_claw_logged(output,caller,open) == PROS_ERR) {
     if (pros::competition::is_autonomous()) {
       ez::autonomous_emergency_stop();
       std::printf("CLAW output write failed\n");
@@ -1421,9 +1428,11 @@ bool claw_set(bool open) {
   claw_state_written = true;
   return true;
 }
-bool claw_open() { return claw_set(true); }
-bool claw_close() { return claw_set(false); }
-bool claw_toggle() { return claw_set(!claw_is_open); }
+bool claw_set(bool open) { return claw_set_logged(open,"CLAW_SET"); }
+bool claw_open() { return claw_set_logged(true,pros::competition::is_autonomous()?"AUTON_OPEN":"CLAW_OPEN"); }
+bool claw_close() { return claw_set_logged(false,pros::competition::is_autonomous()?"AUTON_CLOSE":"CLAW_CLOSE"); }
+bool claw_commanded_closed() { return claw_state_written && !claw_is_open; }
+bool claw_toggle() { return claw_set_logged(!claw_is_open,pros::competition::is_autonomous()?"AUTON_TOGGLE":"DRIVER_R1_TOGGLE"); }
 bool claw_flip_set(bool reverse) {
   if (!mechanism_config::ENABLE_PNEUMATICS || pros::competition::is_disabled()) return false;
   const bool output = reverse ? mechanism_config::FLIP_REVERSE_OUTPUT : !mechanism_config::FLIP_REVERSE_OUTPUT;
@@ -1439,7 +1448,7 @@ bool claw_flip_forward() { return claw_flip_set(false); }
 bool claw_flip_reverse() { return claw_flip_set(true); }
 bool claw_flip_toggle() { return claw_flip_set(!flip_is_reverse); }
 bool claw_object_detected() {
-  return object_detected && pros::millis() - last_distance_sample <= mechanism_config::MAX_UPDATE_GAP_MS;
+  return claw_distance::detected();
 }
 bool mechanism_return_home() {
   return lift_return_home_start();
@@ -1449,6 +1458,7 @@ bool color_toggle_set(bool held) {
 }
 // Shared motor cleanup for faults and mode changes; leave pneumatic positions alone.
 bool stop_all_mechanisms() {
+    claw_distance::cancel();
     flex_hold_active = false;
 
     const bool flex_ok =
@@ -1479,12 +1489,10 @@ bool stop_all_mechanisms() {
 
     std::fflush(stdout);
 
-    object_detected = false;
-    object_readings = 0;
-
     return flex_ok && toggle_ok && lift_ok && arm_ok;
 }
 void mechanisms_print_debug() {
+  claw_distance::diagnostic_update(); // Driver reporting path, never a navigation wait callback.
   static unsigned last_print = 0;
   static bool printed = false;
   const unsigned now = pros::millis();
@@ -1496,7 +1504,7 @@ void mechanisms_print_debug() {
               arm_position_deg(), arm.target, mode_name(arm.mode), arm.homed);
   std::printf("Claw open=%d written=%d | Flip reverse=%d written=%d | Distance enabled=%d detected=%d\n",
               claw_is_open, claw_state_written, flip_is_reverse, flip_state_written,
-              mechanism_config::ENABLE_CLAW_DISTANCE_AUTO_ARM, claw_object_detected());
+              mechanism_config::ENABLE_DRIVER_AUTO_CLAMP, claw_object_detected());
 }
 void test_lift_manual(bool up_held, bool down_held) {
   if (up_held && down_held) manual_axis(lift, true, 0);
@@ -1786,14 +1794,15 @@ bool toggle_command(bool reverse) {
   return false;
 }
 } // namespace
-bool pulse_toggle() {
+bool pulse_toggle() { return pulse_toggle(395); }
+bool pulse_toggle(unsigned pulse_ms) {
   const unsigned began = pros::millis();
-  bool ok = !ez::autonomous_cancelled() && toggle_connected() && toggle_run();
-  while (ok && pros::millis() - began < 395) {
+  bool ok = pulse_ms > 0 && pulse_ms < 0x80000000u && !ez::autonomous_cancelled() && toggle_connected() && toggle_run();
+  while (ok && pros::millis() - began < pulse_ms) {
     ok = !ez::autonomous_cancelled() && toggle_connected();
     if (ok) {     
       const unsigned elapsed = pros::millis() - began;
-      if (elapsed < 395) pros::delay(395 - elapsed < 5 ? 395 - elapsed : 5);
+      if (elapsed < pulse_ms) pros::delay(pulse_ms - elapsed < 5 ? pulse_ms - elapsed : 5);
     }
   }
   const bool stopped = toggle_stop();
@@ -1944,6 +1953,30 @@ PreloadLiftResult lift_preload_update() {
   if (lift.mode == AxisMode::Hold) preload_result = PreloadLiftResult::Reached;
   return preload_result;
 }
+bool lift_auton_target_start(double target_deg, unsigned timeout_ms) {
+  // Do not steal another lift mode. Call lift_auton_stop() before explicit handoff.
+  const double position = lift_position_deg();
+  if (reject_lift_lockout()) return false;
+  if (ez::autonomous_cancelled()) { lift.auton_reason="CANCELLED_OR_MODE"; return false; }
+  if (!timeout_ms || timeout_ms >= 0x80000000u) { lift.auton_reason="INVALID_TIMEOUT"; return false; }
+  if (!lift_target_ready() || !std::isfinite(position) ||
+      position < LIFT_MIN_DEG || position > LIFT_MAX_DEG) {
+    lift.auton_reason="FEEDBACK_HOME_LIMITS_OR_OUTPUT_FAULT"; return false;
+  }
+  if (lift.mode != AxisMode::Disabled || !set_target(lift,true,target_deg,timeout_ms)) {
+    lift.auton_reason="TARGET_OR_OWNERSHIP_REJECTED"; return false;
+  }
+  lift.auton_reason="MOVING_TO_SETTLE";
+  return true;
+}
+LiftAutonTargetStatus lift_auton_target_status() {
+  const bool active = !lift.preload_crossing && !returning_home &&
+      lift_output_owner == LiftOutputOwner::None &&
+      (lift.mode == AxisMode::MoveToTarget || lift.mode == AxisMode::Hold);
+  return {active, active && lift_at_target(), lift_target_ready(),
+          lift.target, lift_position_deg(), lift.target_started,
+          lift.target_timeout_ms, lift.auton_reason};
+}
 bool lift_target_ready() {
   return feedback_ready(lift,true) && limits_ready(true) &&
       std::isfinite(read_position(true)) && !lift_output_fault;
@@ -2054,4 +2087,23 @@ void lift_direction_diagnostic_update() {
   const double delta16 = deg16 - previous[3]; previous[3] = deg16;
   std::printf("LIFT_PASSIVE P16 configured_reversal=%d raw_centideg=%ld deg=%.2f delta_deg=%.2f valid=%d read_errno=%d\n",
     mechanism_config::LIFT_ROTATION_REVERSED,static_cast<long>(raw16),deg16,delta16,valid16,error16);
+}
+
+// Called only by the existing display task. Readback is stored state, NOT voltage.
+void claw_diagnostic_observe_enable(bool enabled) {
+  if(enabled)claw_observation_started=pros::millis();
+  claw_observation_enabled=enabled;
+}
+void claw_diagnostic_observe() {
+  if(!claw_observation_enabled.load())return;
+  if(pros::millis()-claw_observation_started.load()>10000){claw_observation_enabled=false;return;}
+  const int saved=errno;
+  const unsigned before=claw_write_sequence.load();
+  errno=0;const auto config=pros::c::adi_port_get_config(mechanism_config::CLAW_PNEUMATIC_PORT);const int config_error=errno;
+  errno=0;const auto value=pros::c::adi_port_get_value(mechanism_config::CLAW_PNEUMATIC_PORT);const int value_error=errno;
+  std::printf("CLAW_OBSERVE ms=%u last_write_seq=%u seq_after=%u adi=%c config=%ld config_errno=%d stored_value=%ld value_errno=%d autonomous=%d disabled=%d [stored_state_NOT_voltage_or_position]\n",
+    pros::millis(),before,claw_write_sequence.load(),mechanism_config::CLAW_PNEUMATIC_PORT,
+    static_cast<long>(config),config_error,static_cast<long>(value),value_error,
+    pros::competition::is_autonomous(),pros::competition::is_disabled());
+  errno=saved;
 }

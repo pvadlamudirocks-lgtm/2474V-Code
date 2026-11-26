@@ -30,13 +30,13 @@
 // This is a source/build check; it does NOT verify physical motor direction.
 static_assert(!mechanism_config::LIFT_ROTATION_REVERSED &&
               mechanism_config::LIFT_P16_SOFTWARE_SIGN == +1.0,
-              "V6 requires P16 software sign +1 and native reversal false");
+              "V7 requires P16 software sign +1 and native reversal false");
 static_assert(!mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT,
-              "LIFT_FIX_V6: wrong/old subsystems.hpp has LIFT_MOTOR_SAFETY_LOCKOUT=true");
+              "LIFT_FIX_V7: wrong/old subsystems.hpp has LIFT_MOTOR_SAFETY_LOCKOUT=true");
 static_assert(!mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,
-              "LIFT_FIX_V6: passive direction diagnostic still enabled");
+              "LIFT_FIX_V7: passive direction diagnostic still enabled");
 static_assert(mechanism_config::LIFT_LIMITS_CALIBRATED,
-              "LIFT_FIX_V6: lift limits not configured in lift_calibration.hpp");
+              "LIFT_FIX_V7: lift limits not configured in lift_calibration.hpp");
 
 namespace {
 // ----- Tracking geometry and driver settings -----
@@ -196,7 +196,7 @@ void display_odom_pose() {
     pros::screen::set_pen(0x00000000);
     if (!detail) {
       pros::screen::print(pros::E_TEXT_MEDIUM, 1,
-          "LIFT FIX V6   LOCKOUT:%d       ", locked);
+          "LIFT FIX V8   LOCKOUT:%d       ", locked);
       pros::screen::print(pros::E_TEXT_MEDIUM, 2,
           "L1:%d L2:%d  REQ:%-4s P16:%6.1f   ",
           !!(buttons & 1), !!(buttons & 2),
@@ -217,7 +217,7 @@ void display_odom_pose() {
           "D-PAD RIGHT=DETAIL  %s       ", locked ? "NO POWER" : "CHECK LIFT");
     } else {
       pros::screen::print(pros::E_TEXT_MEDIUM, 1,
-          "LIFT DETAIL V6 LOCKOUT:%d     ", locked);
+          "LIFT DETAIL V8 LOCKOUT:%d     ", locked);
       pros::screen::print(pros::E_TEXT_MEDIUM, 2,
           "P13 RAW:%+8ld TEMP:%5.1fC  ",
           t.top_p13.raw_counts, t.top_p13.temperature_c);
@@ -279,6 +279,7 @@ void odom_display_task() {
         !odom_display_frozen && !odom_diagnostic_screen_is_active())
       display_odom_pose();
     odom_display_mutex.give();
+    claw_diagnostic_observe(); // Read-only; enabled only during the stationary claw test.
     pros::delay(ODOM_DISPLAY_REFRESH_MS);
   }
 }
@@ -331,13 +332,17 @@ void initialize() {
       pros::E_TEXT_MEDIUM, 1, "2474V RECOVERY START");
 
   std::printf("RECOVERY: initialize entered\n");
-  std::printf("LIFT_BUILD_ID=2474V_P16_FIX_V6 lockout=%d diagnostic=%d limits=%d motor_mV=%d p16_soft_sign=%+.0f\n",
+  std::printf("CLAW_DIAG_BUILD=2474V_CLAW_H_TRACE_01 compiled=%s %s\n", __DATE__, __TIME__);
+  std::printf("LIFT_BUILD_ID=2474V_GREEN_LIFT_V8 lockout=%d diagnostic=%d limits=%d motor_mV=%d p16_soft_sign=%+.0f\n",
               mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT,
               mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,
               mechanism_config::LIFT_LIMITS_CALIBRATED,
               mechanism_config::LIFT_MANUAL_MV,
               mechanism_config::LIFT_P16_SOFTWARE_SIGN);
   std::fflush(stdout);
+
+  std::printf("LIFT_CONFIG_V8 gears=GREEN nominal_rpm=200 L1=VELOCITY up_target_rpm=%d L2=VELOCITY down_target_rpm=%d [targets, not measured speed]\n",
+              mechanism_config::LIFT_UP_TARGET_RPM, mechanism_config::LIFT_DOWN_TARGET_RPM);
 
   // 1. Prepare drivetrain control.
   chassis.pid_drive_toggle(true);
@@ -461,35 +466,46 @@ static_assert(static_cast<int>(RUN_DEV_TEST)+static_cast<int>(RUN_CUSTOM_AUTON_T
 static_assert(!(RUN_DEV_TEST && RUN_CUSTOM_AUTON_TEST), "Select only one development mode");
 
 void custom_auton_test() {
-  const unsigned began = pros::millis();
-  //bool ok = claw_open();  // Physically CLOSE claw.
-  // if (ok) ok = pulse_toggle();  // Existing 395 ms pulse.
-  // if (ok) ok = lift_boomerang_to(514, 19.42, 7.58, 54.14, 40);
-  // if (ok) ok = preload_lower_for_release(32, 2000);
-  // if (ok) ok = claw_close();  // Physically OPEN claw.
-  // preload_auton_finish_log(began, ok);
-const bool recording = boomerang_motion_trace_arm(10016);
+//   const unsigned began = pros::millis();
+//   //bool ok = claw_open();  // Physically CLOSE claw.
+//   // if (ok) ok = pulse_toggle();  // Existing 395 ms pulse.
+//   // if (ok) ok = lift_boomerang_to(514, 19.42, 7.58, 54.14, 40);
+//   // if (ok) ok = preload_lower_for_release(32, 2000);
+//   // if (ok) ok = claw_close();  // Physically OPEN claw.
+//   // preload_auton_finish_log(began, ok);
+
+// const bool recording = boomerang_motion_trace_arm(10016);
 
 
-std::printf("BOOM DLEAD TEST: speed=70 dlead=0.50 recorder=%d\n",
-            recording);
-std::fflush(stdout);
+// std::printf("BOOM DLEAD TEST: speed=70 dlead=0.50 recorder=%d\n",
+//             recording);
+// std::fflush(stdout);
 
-if (!recording) {
-    std::printf("BOOM DLEAD TEST: recorder unavailable, movement cancelled\n");
-    std::fflush(stdout);
-    return;
-}
-
-
-nav_go_to_pose(20.66, 8.15, 67.58, 70);
-const bool report_ok = boomerang_motion_trace_report();
-
-std::printf("BOOM DLEAD TEST: report result=%d\n", report_ok);
-std::fflush(stdout);
+// if (!recording) {
+//     std::printf("BOOM DLEAD TEST: recorder unavailable, movement cancelled\n");
+//     std::fflush(stdout);
+//     return;
+// }
 
 
-}
+// nav_go_to_pose(20.66, 8.15, 67.58, 70);
+// const bool report_ok = boomerang_motion_trace_report();
+
+// std::printf("BOOM DLEAD TEST: report result=%d\n", report_ok);
+// std::fflush(stdout);
+
+
+claw_close();
+pros::delay(250);
+
+lift_auton_move_to_deg(401.7, 2500, LiftFinish::STOP);
+
+lift_auton_move_to_deg(140.2, 2500, LiftFinish::STOP);
+
+pros::delay(250);
+claw_open();
+
+} 
 
 void autonomous() {
   if (mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC) {
@@ -631,7 +647,7 @@ if (SHOW_LIFT_TELEMETRY_SCREEN) {
     if (current_button_mask!=last_button_mask || now - last_button_log >= 500) {
         last_button_mask=current_button_mask;
         last_button_log = now;
-        std::printf("LIFT_FIX_V6 L1=%d L2=%d accepted=%d lockout=%d limits=%d P16=%.2f rawL1=%ld rawL2=%ld errnoL1=%d errnoL2=%d\n",
+        std::printf("LIFT_FIX_V8 L1=%d L2=%d accepted=%d lockout=%d limits=%d P16=%.2f rawL1=%ld rawL2=%ld errnoL1=%d errnoL2=%d\n",
                     lift_up, lift_down, lift_request_accepted,
                     mechanism_config::LIFT_MOTOR_SAFETY_LOCKOUT ||
                     mechanism_config::ENABLE_LIFT_DIRECTION_DIAGNOSTIC,

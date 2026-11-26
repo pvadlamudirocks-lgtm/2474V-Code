@@ -18,11 +18,17 @@ constexpr int THIRD_LIFT_PORT = 13;
 constexpr int LIFT_ROTATION_PORT = 16;
 // Green cartridges use 18:1 internal gearing, 200 RPM.
 // Confirmed external gearing is 1:1: one output revolution per motor revolution.
-// Documentation only: manual control uses voltage, not a requested output RPM.
+// Driver L1/L2 use independent motor-shaft RPM targets below.
 constexpr double LIFT_MOTOR_RPM = 200.0;
 constexpr double LIFT_SPEED_UP_RATIO = 1.0; // Output speed / motor speed; no scaling.
 constexpr double LIFT_OUTPUT_RPM = LIFT_MOTOR_RPM; // 200 RPM nominal at 1:1, not measured.
-// Keep both PROS lift motors configured as MotorGears::green (18:1, 200 RPM).
+// All three lift motor handles must use green gearing, including telemetry.
+constexpr int LIFT_UP_TARGET_RPM = 200;   // Driver L1: 100% of green 200 RPM nominal.
+constexpr int LIFT_DOWN_TARGET_RPM = 180; // Driver L2: 90% of green 200 RPM nominal.
+static_assert(LIFT_UP_TARGET_RPM > 0 && LIFT_UP_TARGET_RPM <= 200,
+              "Lift UP RPM must be in 1..200");
+static_assert(LIFT_DOWN_TARGET_RPM > 0 && LIFT_DOWN_TARGET_RPM <= 200,
+              "Lift DOWN RPM must be in 1..200");
 constexpr bool ARM_CONFIGURED = false;
 constexpr int ARM_MOTOR_PORT = 17;
 constexpr int ARM_ROTATION_PORT = 0; // Retired P18 sensor remains unbound.
@@ -106,7 +112,7 @@ constexpr bool LIFT_BOTTOM_LIMIT_PRESSED_VALUE = true; // Verify actual wiring.
 constexpr unsigned LIFT_RETURN_TIMEOUT_MS = 0;
 // TODO bind the Over ride color mechanism; unrelated to the existing claw flip.
 // No device type/port is assumed. Implement color_toggle_set() when selected.
-constexpr bool CLAW_OPEN_OUTPUT = false; // User-tested mapping: OFF opens, ON closes; retest after change.
+constexpr bool CLAW_OPEN_OUTPUT = true; // User-tested mapping: OFF opens, ON closes; retest after change.
 constexpr bool FLIP_REVERSE_OUTPUT = true; // false output should be normal.
 // Driver confirmed UP with port14 positive / port15 negative in the raw test.
 
@@ -201,7 +207,15 @@ constexpr unsigned TARGET_SETTLE_MS = 200;
 constexpr unsigned TARGET_TIMEOUT_MS = 2000; // TODO VERIFY real travel time.
 constexpr unsigned DEBUG_PERIOD_MS = 500;
 
-constexpr bool ENABLE_CLAW_DISTANCE_AUTO_ARM = false;
+// Legacy arm trigger retired. Driver claw auto-close has its own explicit gate.
+constexpr bool ENABLE_CLAW_DISTANCE_AUTO_ARM = false; // Compatibility only; no actuator effect.
+constexpr bool ENABLE_CLAW_DISTANCE_DIAGNOSTIC = true;
+constexpr unsigned CLAW_DISTANCE_DIAGNOSTIC_MS = 100;
+constexpr bool ENABLE_DRIVER_AUTO_CLAMP = false;
+constexpr bool CLAW_AUTO_CLAMP_POLARITY_VERIFIED = false;
+constexpr unsigned CLAW_DETECT_REMOVAL_READINGS = 3;
+constexpr unsigned CLAW_DISTANCE_FRESHNESS_MS = 100;
+constexpr unsigned CLAW_AUTO_CLAMP_TIMEOUT_MS = 0; // Choose a finite driver arming window.
 constexpr bool CLAW_DISTANCE_CALIBRATED = false;
 constexpr int CLAW_DETECT_MIN_MM = 0;
 constexpr int CLAW_DETECT_MAX_MM = 0;
@@ -283,6 +297,17 @@ const char* lift_auton_last_reason(); // Last blocking move; static reason, no s
 // HOLD requires validation and continued mechanism updates after this blocking call.
 bool lift_auton_move_to_deg(double target_deg, unsigned timeout_ms, LiftFinish finish);
 bool lift_target_ready();
+// Same autonomous caller must service mechanisms_update() every UPDATE_PERIOD_MS.
+// Normal tolerance/settle controller, never preload crossing; no zero/reference reset.
+// Stop when settled unless continued active holding has been physically qualified.
+bool lift_auton_target_start(double target_deg, unsigned timeout_ms);
+struct LiftAutonTargetStatus {
+  bool active, settled, ready;
+  double target_deg, position_deg;
+  unsigned started_ms, timeout_ms;
+  const char* reason;
+};
+LiftAutonTargetStatus lift_auton_target_status(); // Read-only, same task as controller.
 // Select a configured HOME/CLEARANCE/SCORE/MAX_SAFE entry from lift_calibration.hpp.
 bool lift_move_calibrated_position(unsigned preset, unsigned timeout_ms, LiftFinish finish = LiftFinish::STOP);
 bool toggle_connected();
@@ -317,11 +342,12 @@ bool claw_set(bool open);
 bool claw_open();
 bool claw_close();
 bool claw_toggle();
+bool claw_commanded_closed(); // Commanded state only, NOT physical feedback.
 bool claw_flip_set(bool reverse);
 bool claw_flip_forward();
 bool claw_flip_reverse();
 bool claw_flip_toggle();
-bool claw_object_detected(); // Cached, debounced, freshness-checked result.
+bool claw_object_detected(); // Fresh in-range status while auto detection is serviced; not physical capture.
 // Switch-based descent, STOP, then close claw; arm stays put.
 bool mechanism_return_home();
 bool stop_all_mechanisms(); // Best-effort motor stop/cancel; no pneumatic changes.
@@ -358,6 +384,7 @@ bool flex_intake(int power = mechanism_config::FLEX_INTAKE_POWER);
 bool flex_outtake(int power = mechanism_config::FLEX_OUTTAKE_POWER);
 bool flex_stop();
 bool pulse_toggle();  // Cancellable 395 ms pulse, followed by stop.
+bool pulse_toggle(unsigned pulse_ms); // Same command path, caller-supplied finite duration.
 bool toggle_run();
 bool toggle_run_reverse();
 bool toggle_stop();
@@ -381,3 +408,7 @@ auto_clamp::State auton_auto_clamp_state();
 const char* auton_auto_clamp_reason(); // Static diagnostic string; no terminal IO in update.
 // Passive sample; commands zero only. Call from the diagnostic driver loop.
 void lift_direction_diagnostic_update();
+
+// Temporary read-only ADI observation for the stationary claw test.
+void claw_diagnostic_observe_enable(bool enabled);
+void claw_diagnostic_observe();

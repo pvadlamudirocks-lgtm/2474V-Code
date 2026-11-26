@@ -79,7 +79,7 @@ void logger(void*) {
 }
 void control(void*) {
   // Only this persistent task creates lift devices or writes their outputs.
-  pros::Motor motors[3]={pros::Motor(ports[0],pros::v5::MotorGears::green),pros::Motor(ports[1],pros::v5::MotorGears::green),pros::Motor(ports[2],pros::v5::MotorGears::green)};
+  pros::Motor motors[3]={pros::Motor(ports[0],pros::v5::MotorGears::blue),pros::Motor(ports[1],pros::v5::MotorGears::blue),pros::Motor(ports[2],pros::v5::MotorGears::blue)};
   pros::Rotation sensor(mechanism_config::LIFT_ROTATION_REVERSED?-mechanism_config::LIFT_ROTATION_PORT:mechanism_config::LIFT_ROTATION_PORT);
   pros::Controller controller(pros::E_CONTROLLER_MASTER);
   Policy policy; Frame f,pending;bool summary_pending=false,reference_sampled=false;

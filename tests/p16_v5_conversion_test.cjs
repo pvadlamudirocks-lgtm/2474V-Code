@@ -31,7 +31,7 @@ enum class LiftOutputOwner{None,Driver,Autonomous};LiftOutputOwner lift_output_o
 enum class LiftBottomLimit{Unconfigured,Pressed,Released,Fault};
 LiftBottomLimit lift_bottom_limit_read(){return LiftBottomLimit::Unconfigured;}
 namespace pros {namespace competition {bool is_connected(){return false;}}}
-int last_mv=99999;bool write_lift_pair(int mv){last_mv=mv;return true;}
+int last_mv=99999;bool last_velocity=false;bool write_lift_pair(int mv,bool velocity=false){last_mv=mv;last_velocity=velocity;return true;}
 void trace_lift_path(unsigned,const char*,int,double=NAN){}
 struct Arm{int move_voltage(int){return 1;}}arm;Arm& arm_motor(){return arm;}
 ${extractFunction('write_voltage')}
@@ -56,6 +56,10 @@ int main(){
  sensor.raw=-7005;assert(read_position(true)<0);assert(write_voltage(true,-12000)&&last_mv==0);
  sensor.raw=PROS_ERR;assert(!write_voltage(true,-12000)&&last_mv==0);
  p16_native_ready=false;assert(!write_voltage(true,-12000)&&last_mv==0);
+ p16_native_ready=true;sensor.raw=15205;assert(write_voltage(true,-12000,true)&&last_mv==-12000&&last_velocity);
+ sensor.raw=200;assert(write_voltage(true,-12000,true)&&last_mv==0&&!last_velocity);
+ sensor.raw=PROS_ERR;assert(!write_voltage(true,-12000,true)&&last_mv==0&&!last_velocity);
+ sensor.raw=15205;p16_native_ready=true;assert(write_voltage(true,0,true)&&last_mv==0&&!last_velocity);
  puts("PASS actual V6 converter and native-config predicate: sign, zero, 38.5/2/3000 boundaries AND actual voltage-writer cutoff behavior, lowering, read errors, config mismatch");
 }`;
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'p16-v6-'));fs.writeFileSync(path.join(dir,'test.cpp'),code);

@@ -1,76 +1,92 @@
-# Autonomous object-region clamp (disabled pending rebuild)
+# Claw distance sensing and automatic close
 
-No current route arms this feature. It detects an object in a calibrated region;
-it cannot identify a Pin or confirm physical capture. A successful trigger records
-one successful semantic close command, not physical closure.
+## Shipped state
+CLAW_DISTANCE_PORT=0. Driver and autonomous automatic closing remain false;
+all range/polarity calibration gates remain false, distances and arming timeouts
+remain zero. No route arms auto-clamp. V7 lift and navigation behavior are unchanged.
+ENABLE_CLAW_DISTANCE_AUTO_ARM is retained only for source compatibility and has
+no actuator effect; the legacy arm_move_score detection action was removed.
 
-## Required configuration in include/subsystems.hpp
-- CLAW_DISTANCE_PORT: verified unused Smart Port (currently 0); the existing
-  active_smart_ports_unique static assertion covers it.
-- AUTON_AUTO_CLAMP_MIN_MM / MAX_MM: measured object-region bounds (currently 0).
-- AUTON_AUTO_CLAMP_READINGS: at least 2 distinct timed samples (currently 0).
-- AUTON_AUTO_CLAMP_SAMPLE_MS: measured supported sensor sampling interval (0).
-- AUTON_AUTO_CLAMP_FRESHNESS_MS: maximum sample gap/read duration (0).
-- AUTON_AUTO_CLAMP_TIMEOUT_MS: finite pickup window, greater than freshness (0).
-- AUTON_AUTO_CLAMP_RANGE_CALIBRATED: false until range/mounting are qualified.
-- AUTON_AUTO_CLAMP_POLARITY_VERIFIED: false until semantic open/close are verified.
-- ENABLE_AUTON_AUTO_CLAMP: false until supervised qualification.
-Keep ENABLE_CLAW_DISTANCE_AUTO_ARM false: this is independent of the old arm
-detection path, and auto-clamp rejects operation if the old path is enabled.
+## Passive measurement
+Assign CLAW_DISTANCE_PORT only after verifying actual wiring and unused port
+ownership (P19 belongs to Toggle). Keep both auto flags false. The shared accessor
+never constructs port zero. ENABLE_CLAW_DISTANCE_DIAGNOSTIC=true prints from the
+existing driver mechanisms_print_debug path about every 100 ms, before that
+function's separate 500-ms mechanism-log throttle. It does not print inside
+navigation wait callbacks. No new task, screen writer, actuator call or sensor
+reset is used by passive sampling. Ordinary robot startup/manual controls are
+still active; this is not an isolated passive firmware mode. In particular,
+existing startup writes claw OFF and initializes other mechanisms.
 
-Current software maps claw_open()/claw_set(true) to CLAW_OPEN_OUTPUT=false (OFF)
-and claw_close()/claw_set(false) to ON. Existing route comments contradict this
-physical interpretation. Do not invert polarity based on comments. Verify it on
-the rebuilt claw before setting the new verification gate.
-Commanded open is not position feedback.
+Build/upload manually, start supported at established lift home, enter driver
+control, keep controls released, and open PROS terminal. Expect CLAW_DISTANCE
+port=0 status=UNCONFIGURED before port assignment. After assignment, VALID lines
+contain millimeters and confidence or NA (confidence is unavailable <=200 mm).
+NO_OBJECT, DISCONNECTED, READ_ERROR, INVALID and LOW_CONFIDENCE are distinct.
+No numeric distance is printed for invalid/no-object results. errno is included.
+Brain Devices -> sensor -> millimeters remains a no-program alternative.
 
-## Future integration sketch (comments only; NOT a runnable route)
-// Verify physical semantic open/close first.
-// Prepare claw using claw_open(); abort the pickup if it fails.
-// Create the existing NavSequence scope before arming (it performs cleanup).
-// if (!auton_auto_clamp_arm()) stop/recover without attempting the pickup.
-// Approach using a qualified existing NavSequence movement with its existing
-// timeout/cancellation safeguards. Its wait service calls mechanisms_update(),
-// which services auto-clamp. No coordinates or new movement commands here.
-// Check auton_auto_clamp_triggered(), auton_auto_clamp_state(), and
-// auton_auto_clamp_reason() after the motion has stopped.
-// If not triggered, stop/recover; do not assume capture or automatically retry.
-// auton_auto_clamp_disarm() before leaving the pickup region.
+## Configuration (include/subsystems.hpp)
+Driver: ENABLE_DRIVER_AUTO_CLAMP, CLAW_DISTANCE_CALIBRATED,
+CLAW_AUTO_CLAMP_POLARITY_VERIFIED, CLAW_DETECT_MIN_MM/MAX_MM,
+CLAW_DETECT_CONSISTENT_READINGS (3), CLAW_DISTANCE_SAMPLE_MS (20),
+CLAW_DISTANCE_FRESHNESS_MS (100), CLAW_AUTO_CLAMP_TIMEOUT_MS (0).
+Shared: CLAW_DETECT_REMOVAL_READINGS (3), CLAW_DETECT_MIN_CONFIDENCE (20),
+CLAW_DISTANCE_PORT, CLAW_OPEN_OUTPUT (false; preserve until physical verification).
+Diagnostic: ENABLE_CLAW_DISTANCE_DIAGNOSTIC, CLAW_DISTANCE_DIAGNOSTIC_MS (100).
+Autonomous: ENABLE_AUTON_AUTO_CLAMP, AUTON_AUTO_CLAMP_RANGE_CALIBRATED,
+AUTON_AUTO_CLAMP_POLARITY_VERIFIED, AUTON_AUTO_CLAMP_MIN_MM/MAX_MM,
+AUTON_AUTO_CLAMP_READINGS/SAMPLE_MS/FRESHNESS_MS/TIMEOUT_MS (all zero).
 
-A NavSequence finish/abort, autonomous cleanup, disabled, and opcontrol cleanup
-all use stop_all_mechanisms(), which revokes arming without opening the claw.
-Explicit claw commands also revoke arming. arm/update belong to the same
-autonomous caller. Nonblocking mutex acquisition serializes those calls;
-lifecycle disarm atomically revokes arming. Mode/cancellation is checked again
-after sensor reads and immediately before the existing claw_close API.
+Ranges and timeouts must be measured/chosen before enabling. Config requires
+positive min, max>=min and <9999, >=2 entry/removal readings, positive sample
+interval, freshness>=sample interval, finite timeout>freshness and <2^31 ms,
+and enough timeout for the configured entry readings. Choose enough time for
+both removal and entry. Values in tests are synthetic fixtures, not calibration.
 
-Not every legacy blocking navigation wrapper calls mechanisms_update().
-Do not arm around an unserviced legacy movement. No global wait hook was replaced.
-Outside a serviced sequence, the caller must update regularly; a late update
-times out before commanding closure. This is cooperative, not an independent
-watchdog. Cancellation cannot undo a pneumatic command already issued.
+## Behavior and ownership
+One detector and one sampler serve the currently selected mode. Driver arming
+starts on an enabled driver session or explicit claw command; autonomous requires
+an explicit successful auton_auto_clamp_arm() in an enabled autonomous session.
+Every new arm/manual override requires multiple consecutive valid OUT-OF-RANGE
+readings, then consecutive valid IN-RANGE readings. No-object (9999), missing
+sensor, read errors, low confidence or stale samples never count as removal;
+they revoke the removal qualification. Close-range confidence is not required.
+A no-object background alone therefore cannot rearm: a measurable out-of-range
+background/target is required. This conservative behavior must be tested at the
+actual mount before enabling.
 
-The detector requires the lift disabled, no lift fault, no arm movement/hold,
-no homing, and no active flex or Toggle output (invalid voltage reads reject).
-It does not start/stop those mechanisms or interfere with drivetrain output.
-No console IO or delay is added by the update itself. Existing claw API failure
-logging/cancellation behavior remains intact.
+One successful event calls existing claw_close() once, with existing polarity,
+return-home, disabled and autonomous-cancellation checks. An already commanded
+closed claw produces ALREADY_COMMANDED_CLOSED without an output call. Results
+mean command state only, never confirmed physical closure/capture. Failure
+latches detector Fault until restart; no automatic retries. Driver timeout does
+not automatically restart; an explicit claw command or mode change begins a new
+window, again requiring removal. After a successful close, manual opening starts
+a new removal-qualified window. Autonomous requires explicit rearming.
 
-Invalid/out-of-range samples reset the count; missing sensor faults an armed
-pickup. Timeout disarms without closure. A close write is attempted once;
-failure latches Fault until program restart. Disarm preserves terminal results
-for inspection. Explicit rearming clears a prior success/timeout result.
-Freshness measures software read timing; PROS provides no per-reading hardware
-timestamp, so a stuck-but-plausible sensor value cannot be ruled out in software.
+Explicit claw commands revoke automatic intent before attempting a nonblocking
+claw gate. Busy requests return false rather than queue; driver R1 already reports
+write failure. Automatic close reenters the same gate only on the same task.
+Cleanup invalidates an atomic generation without waiting for the gate. Mode,
+cancellation, generation and deadline are checked after sampling and before close.
+A mode switch after the last software check cannot undo an already-issued ADI
+command. There is no claim of instantaneous pneumatic stopping.
 
-## Qualification
-1. With feature disabled, verify wiring, port ownership, pneumatic polarity, and
-   mount stability. Keep hands out of the claw and support mechanisms.
-2. Collect sensor readings with/without the intended object at pickup angles;
-   choose bounds, sampling, debounce, freshness and finite timeout from evidence.
-3. Confirm semantic open/close and safe stationary mechanism conditions.
-4. Enable only in a supervised, explicitly armed stationary autonomous test.
-   Verify absent sensor, out-of-range objects, noise, timeout, cancellation,
-   disable, driver transition, and one-shot success. Do not test on a person.
-5. Only then integrate a separately reviewed serviced approach. Physical testing
-   is still required; no hardware qualification is claimed by the build/tests.
+mechanisms_update -> update_object_detection -> claw_distance::update is the
+active integration. Existing NavSequence wait service calls mechanisms_update;
+not every legacy movement does. Do not arm around an unserviced movement.
+stop_all_mechanisms and mechanisms_initialize revoke arming. No route is changed.
+No new interlock with unrelated mechanisms is claimed; callers must choose a
+physically safe pickup window. Existing claw_set rejects closing during return-home.
+
+## Validation and physical qualification
+Host tests cover classification, removal/entry boundaries, initial object,
+manual override, one-shot, disconnected/no-object/stale readings, mode changes,
+timeout, cancellation, output failure and wraparound. They simulate APIs; they
+do not establish device latency, sensor accuracy, pressure, actual polarity,
+closure timing or object capture. PROS has no hardware timestamp here: freshness
+measures software sampling age, not proof that plausible sensor values changed.
+Use stationary supervised pneumatic testing before any moving approach. Verify
+clear beam, mounting, OFF/open and ON/close, release/manual override, and behavior
+with the object removed. Keep hands clear and secure/support the mechanism.
